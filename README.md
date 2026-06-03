@@ -93,10 +93,10 @@ codex    # OpenAI Codex CLI
 
 Kernel debugging uses KDNET between the Hyper-V host/debugger and the VM/debuggee. WinDbg is only needed on the debugger machine.
 
-On the host/debugger, optionally install WinDbg and open the KDNET firewall port:
+Shut down the VM, then on the host/debugger optionally install WinDbg, open the KDNET firewall port, and disable VM Secure Boot so the guest can change BCDEdit debug settings:
 
 ```powershell
-.\scripts\Setup-KernelDebugger.ps1 -InstallWinDbg
+.\scripts\Setup-KernelDebugger.ps1 -InstallWinDbg -DisableVmSecureBoot
 ```
 
 The script prints a KDNET key and the matching WinDbg command. Inside the VM/debuggee, run as Administrator with the host IP and the same key:
@@ -115,6 +115,12 @@ To disable kernel debugging inside the VM:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -Disable
+```
+
+After the VM shuts down, Secure Boot can be restored on the host:
+
+```powershell
+.\scripts\Setup-KernelDebugger.ps1 -EnableVmSecureBoot
 ```
 
 ### Restore to clean state

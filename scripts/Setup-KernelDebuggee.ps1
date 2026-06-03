@@ -35,7 +35,12 @@ $ErrorActionPreference = "Stop"
 function New-KdNetKey {
     $alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
     $bytes = New-Object byte[] 48
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
+    }
 
     $parts = for ($group = 0; $group -lt 4; $group++) {
         $chars = for ($i = 0; $i -lt 12; $i++) {
@@ -48,6 +53,24 @@ function New-KdNetKey {
     $parts -join "."
 }
 
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    & $Command @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE."
+    }
+}
+
 Write-Host ""
 Write-Host "----------------------------------------------"
 Write-Host "  Kernel Debuggee VM Setup"
@@ -56,7 +79,10 @@ Write-Host ""
 
 if ($Disable) {
     if ($PSCmdlet.ShouldProcess("BCD debug setting", "Disable kernel debugging")) {
-        bcdedit /debug off
+        Invoke-NativeCommand `
+            -Command "bcdedit" `
+            -Arguments @("/debug", "off") `
+            -Description "bcdedit /debug off"
     }
 
     Write-Host ""
@@ -71,11 +97,17 @@ if (-not $Key) {
 }
 
 if ($PSCmdlet.ShouldProcess("BCD debug setting", "Enable kernel debugging")) {
-    bcdedit /debug on
+    Invoke-NativeCommand `
+        -Command "bcdedit" `
+        -Arguments @("/debug", "on") `
+        -Description "bcdedit /debug on"
 }
 
 if ($PSCmdlet.ShouldProcess("BCD dbgsettings", "Configure KDNET endpoint")) {
-    bcdedit /dbgsettings net "hostip:$DebuggerHostIp" "port:$Port" "key:$Key"
+    Invoke-NativeCommand `
+        -Command "bcdedit" `
+        -Arguments @("/dbgsettings", "net", "hostip:$DebuggerHostIp", "port:$Port", "key:$Key") `
+        -Description "bcdedit /dbgsettings net"
 }
 
 $windbgCommand = "windbgx -k net:port=$Port,key=$Key"
