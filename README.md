@@ -99,7 +99,7 @@ Shut down the VM, then on the host/debugger optionally install WinDbg, open the 
 .\scripts\Setup-KernelDebugger.ps1 -InstallWinDbg -DisableVmSecureBoot
 ```
 
-The script prints a KDNET key and the matching WinDbg command. Inside the VM/debuggee, run as Administrator with the host IP and the same key:
+The firewall rule defaults to `LocalSubnet`; pass `-RemoteAddress <vm-ip-or-cidr>` to restrict it to a specific VM address or subnet. The script prints a KDNET key and the matching WinDbg command. Inside the VM/debuggee, run as Administrator with the host IP and the same key:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -DebuggerHostIp <host-ip> -Key <key>

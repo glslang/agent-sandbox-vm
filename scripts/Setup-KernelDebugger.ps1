@@ -10,6 +10,10 @@ param(
     [ValidateRange(49152, 65535)]
     [int]$Port = 50000,
 
+    # Remote VM IP, CIDR range, or firewall keyword allowed to reach the KDNET port.
+    [ValidateNotNullOrEmpty()]
+    [string[]]$RemoteAddress = @("LocalSubnet"),
+
     # VM to prepare for BCDEdit-based kernel debugging.
     [string]$VMName,
 
@@ -148,7 +152,26 @@ $ruleName = "Agent Sandbox KDNET Debugger UDP $Port"
 $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
 
 if ($existingRule) {
-    Write-Host "Firewall rule already exists: $ruleName"
+    if ($PSCmdlet.ShouldProcess($ruleName, "Update inbound UDP firewall rule")) {
+        foreach ($rule in $existingRule) {
+            Set-NetFirewallRule `
+                -InputObject $rule `
+                -Direction Inbound `
+                -Action Allow `
+                -Enabled True `
+                -Profile Any
+
+            $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
+                -Protocol UDP `
+                -LocalPort $Port
+
+            $rule | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter `
+                -RemoteAddress $RemoteAddress
+        }
+
+        Write-Host "Firewall rule updated: $ruleName"
+        Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
+    }
 } elseif ($PSCmdlet.ShouldProcess($ruleName, "Create inbound UDP firewall rule")) {
     New-NetFirewallRule `
         -DisplayName $ruleName `
@@ -156,9 +179,11 @@ if ($existingRule) {
         -Action Allow `
         -Protocol UDP `
         -LocalPort $Port `
+        -RemoteAddress $RemoteAddress `
         -Profile Any | Out-Null
 
     Write-Host "Firewall rule created: $ruleName"
+    Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
 }
 
 $windbgCommand = "windbgx -k net:port=$Port,key=$Key"
