@@ -70,6 +70,12 @@ Copy-Item -ToSession $session `
           -Destination "C:\Invoke-Provision.ps1"
 Write-Host "  Copied: Invoke-Provision.ps1"
 
+# Copy optional VM-side kernel debuggee setup script
+Copy-Item -ToSession $session `
+          -Path "$PSScriptRoot\Setup-KernelDebuggee.ps1" `
+          -Destination "C:\Setup-KernelDebuggee.ps1"
+Write-Host "  Copied: Setup-KernelDebuggee.ps1"
+
 # Copy VS Build Tools offline layout if it exists on host
 $vsLayoutPath = "$($cfg.CacheRoot)\vs-layout\layout"
 if (Test-Path "$vsLayoutPath\vs_buildtools.exe") {

@@ -34,7 +34,7 @@ If you didn't provide `autounattend.xml`, complete the setup prompts in the VM c
 
 This runs **on your host** and:
 - Switches the VM to Default Switch (internet access)
-- Copies VS Build Tools offline layout + provision script into the VM
+- Copies VS Build Tools offline layout + VM-side setup scripts into the VM
 - Opens the VM console
 
 Then **inside the VM**, run:
@@ -89,6 +89,34 @@ codex    # OpenAI Codex CLI
 .\scripts\Copy-Artifacts.ps1 -ExtraPatterns "*.json","*.toml"
 ```
 
+### Kernel debugging
+
+Kernel debugging uses KDNET between the Hyper-V host/debugger and the VM/debuggee. WinDbg is only needed on the debugger machine.
+
+On the host/debugger, optionally install WinDbg and open the KDNET firewall port:
+
+```powershell
+.\scripts\Setup-KernelDebugger.ps1 -InstallWinDbg
+```
+
+The script prints a KDNET key and the matching WinDbg command. Inside the VM/debuggee, run as Administrator with the host IP and the same key:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -DebuggerHostIp <host-ip> -Key <key>
+```
+
+Reboot the VM, then start WinDbg on the host with the command printed by either script:
+
+```powershell
+windbgx -k net:port=50000,key=<key>
+```
+
+To disable kernel debugging inside the VM:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -Disable
+```
+
 ### Restore to clean state
 
 ```powershell
@@ -111,6 +139,8 @@ agent-sandbox-vm/
 |   |-- Attach-ISO.ps1         # Alternative: boot from DVD if DISM not needed
 |   |-- Start-Provision.ps1    # Host-side: switches network, copies files into VM
 |   |-- Invoke-Provision.ps1   # VM-side: installs toolchain + Claude Code
+|   |-- Setup-KernelDebugger.ps1 # Host-side: WinDbg + KDNET firewall setup
+|   |-- Setup-KernelDebuggee.ps1 # VM-side: BCD/KDNET debuggee setup
 |   |-- Save-BaseSnapshot.ps1  # Takes the clean base snapshot
 |   |-- Save-VMCredentials.ps1 # Stores VM credentials encrypted on host
 |   +-- Copy-Artifacts.ps1     # Extracts build outputs from VM to host
