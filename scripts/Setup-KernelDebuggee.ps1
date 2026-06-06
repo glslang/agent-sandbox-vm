@@ -71,6 +71,25 @@ function Invoke-NativeCommand {
     }
 }
 
+function Assert-SecureBootDisabled {
+    $cmd = Get-Command Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        Write-Warning "Confirm-SecureBootUEFI is unavailable; continuing without Secure Boot validation."
+        return
+    }
+
+    try {
+        $secureBootEnabled = Confirm-SecureBootUEFI
+    } catch {
+        Write-Warning "Could not determine Secure Boot state: $($_.Exception.Message)"
+        return
+    }
+
+    if ($secureBootEnabled) {
+        throw "Secure Boot is enabled. Shut down this VM, run Setup-KernelDebugger.ps1 -DisableVmSecureBoot -SkipFirewall on the Hyper-V host, then rerun this script."
+    }
+}
+
 Write-Host ""
 Write-Host "----------------------------------------------"
 Write-Host "  Kernel Debuggee VM Setup"
@@ -83,10 +102,14 @@ if ($Disable) {
             -Command "bcdedit" `
             -Arguments @("/debug", "off") `
             -Description "bcdedit /debug off"
+
+        Write-Host ""
+        Write-Host "Kernel debugging disabled. Reboot the VM for the change to take effect."
+    } else {
+        Write-Host ""
+        Write-Host "Kernel debugging was not changed."
     }
 
-    Write-Host ""
-    Write-Host "Kernel debugging disabled. Reboot the VM for the change to take effect."
     exit 0
 }
 
@@ -96,30 +119,33 @@ if (-not $Key) {
     $Key = $Key.ToLowerInvariant()
 }
 
-if ($PSCmdlet.ShouldProcess("BCD debug setting", "Enable kernel debugging")) {
+if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and configure KDNET endpoint")) {
+    Assert-SecureBootDisabled
+
     Invoke-NativeCommand `
         -Command "bcdedit" `
         -Arguments @("/debug", "on") `
         -Description "bcdedit /debug on"
-}
 
-if ($PSCmdlet.ShouldProcess("BCD dbgsettings", "Configure KDNET endpoint")) {
     Invoke-NativeCommand `
         -Command "bcdedit" `
         -Arguments @("/dbgsettings", "net", "hostip:$DebuggerHostIp", "port:$Port", "key:$Key") `
         -Description "bcdedit /dbgsettings net"
+
+    $windbgCommand = "windbgx -k net:port=$Port,key=$Key"
+
+    Write-Host ""
+    Write-Host "Kernel debuggee setup ready."
+    Write-Host ""
+    Write-Host "Reboot this VM, then start WinDbg on the debugger host with:"
+    Write-Host "  $windbgCommand"
+    Write-Host ""
+    Write-Host "Debugger host IP:"
+    Write-Host "  $DebuggerHostIp"
+    Write-Host ""
+    Write-Host "KDNET key:"
+    Write-Host "  $Key"
+} else {
+    Write-Host ""
+    Write-Host "Kernel debuggee setup was not applied."
 }
-
-$windbgCommand = "windbgx -k net:port=$Port,key=$Key"
-
-Write-Host ""
-Write-Host "Kernel debuggee setup ready."
-Write-Host ""
-Write-Host "Reboot this VM, then start WinDbg on the debugger host with:"
-Write-Host "  $windbgCommand"
-Write-Host ""
-Write-Host "Debugger host IP:"
-Write-Host "  $DebuggerHostIp"
-Write-Host ""
-Write-Host "KDNET key:"
-Write-Host "  $Key"

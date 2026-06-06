@@ -99,7 +99,7 @@ On the debugger machine, optionally install WinDbg and open the KDNET firewall p
 powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebugger.ps1 -InstallWinDbg
 ```
 
-The firewall rule defaults to `LocalSubnet`; pass `-RemoteAddress <debuggee-ip-or-cidr>` to restrict it to a specific VM address or subnet. The script prints a KDNET key and the matching WinDbg command.
+The firewall rule defaults to `LocalSubnet`; pass `-RemoteAddress <debuggee-ip-or-cidr>` to restrict it to a specific VM address or subnet. If the default UDP port is reserved on the debugger machine, the script fails before creating the rule; rerun with a different `-Port` and use the same value on the debuggee script. The script prints a KDNET key and the matching WinDbg command.
 
 On the Hyper-V host, shut down the debuggee VM and disable Secure Boot so the guest can change BCDEdit debug settings:
 
