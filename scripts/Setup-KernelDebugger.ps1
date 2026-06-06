@@ -15,6 +15,10 @@ param(
     [ValidateNotNullOrEmpty()]
     [string[]]$RemoteAddress = @("LocalSubnet"),
 
+    # Firewall profiles where the KDNET listener is allowed.
+    [ValidateSet("Domain", "Private", "Public", "Any")]
+    [string[]]$FirewallProfile = @("Domain", "Private"),
+
     # Hyper-V VM to prepare for BCDEdit-based kernel debugging. Host only.
     [string]$VMName,
 
@@ -133,6 +137,10 @@ if ($DisableVmSecureBoot -and $EnableVmSecureBoot) {
     throw "Use only one of -DisableVmSecureBoot or -EnableVmSecureBoot."
 }
 
+if ($FirewallProfile -contains "Any" -and $FirewallProfile.Count -gt 1) {
+    throw "Use -FirewallProfile Any by itself, or choose one or more of Domain, Private, Public."
+}
+
 if ($InstallWinDbg) {
     if (-not (Test-CommandExists -Name "winget")) {
         throw "winget was not found. Install App Installer from Microsoft Store, then rerun this script."
@@ -191,7 +199,7 @@ if (-not $SkipFirewall) {
                     -Direction Inbound `
                     -Action Allow `
                     -Enabled True `
-                    -Profile Any
+                    -Profile $FirewallProfile
 
                 $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
                     -Protocol UDP `
@@ -203,6 +211,7 @@ if (-not $SkipFirewall) {
 
             Write-Host "Firewall rule updated: $ruleName"
             Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
+            Write-Host "  Profile: $($FirewallProfile -join ', ')"
             $firewallConfigured = $true
         }
     } elseif ($PSCmdlet.ShouldProcess($ruleName, "Create inbound UDP firewall rule")) {
@@ -213,10 +222,11 @@ if (-not $SkipFirewall) {
             -Protocol UDP `
             -LocalPort $Port `
             -RemoteAddress $RemoteAddress `
-            -Profile Any | Out-Null
+            -Profile $FirewallProfile | Out-Null
 
         Write-Host "Firewall rule created: $ruleName"
         Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
+        Write-Host "  Profile: $($FirewallProfile -join ', ')"
         $firewallConfigured = $true
     }
 
