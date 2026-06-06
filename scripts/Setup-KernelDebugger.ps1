@@ -84,6 +84,28 @@ function Invoke-NativeCommand {
     }
 }
 
+function Test-UdpPortExcluded {
+    param([Parameter(Mandatory = $true)][int]$Port)
+
+    $output = & netsh int ipv4 show excludedportrange protocol=udp 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not query IPv4 UDP excluded port ranges; continuing without reserved-port validation."
+        return $false
+    }
+
+    foreach ($line in $output) {
+        if ($line -match '^\s*(\d+)\s+(\d+)(?:\s|$)') {
+            $start = [int]$matches[1]
+            $end = [int]$matches[2]
+            if ($Port -ge $start -and $Port -le $end) {
+                return $true
+            }
+        }
+    }
+
+    $false
+}
+
 function Resolve-VMName {
     if ($VMName) {
         return $VMName
@@ -147,12 +169,17 @@ if ($DisableVmSecureBoot -or $EnableVmSecureBoot) {
 }
 
 if (-not $SkipFirewall) {
+    if (Test-UdpPortExcluded -Port $Port) {
+        throw "UDP port $Port is in a Windows excluded port range on this debugger machine. Rerun with a different -Port and use the same port on the debuggee."
+    }
+
     if (-not $Key) {
         $Key = New-KdNetKey
     } else {
         $Key = $Key.ToLowerInvariant()
     }
 
+    $firewallConfigured = $false
     $ruleName = "Agent Sandbox KDNET Debugger UDP $Port"
     $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
 
@@ -176,6 +203,7 @@ if (-not $SkipFirewall) {
 
             Write-Host "Firewall rule updated: $ruleName"
             Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
+            $firewallConfigured = $true
         }
     } elseif ($PSCmdlet.ShouldProcess($ruleName, "Create inbound UDP firewall rule")) {
         New-NetFirewallRule `
@@ -189,6 +217,13 @@ if (-not $SkipFirewall) {
 
         Write-Host "Firewall rule created: $ruleName"
         Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
+        $firewallConfigured = $true
+    }
+
+    if (-not $firewallConfigured) {
+        Write-Host ""
+        Write-Host "Debugger setup was not applied."
+        exit 0
     }
 
     $windbgCommand = "windbgx -k net:port=$Port,key=$Key"
