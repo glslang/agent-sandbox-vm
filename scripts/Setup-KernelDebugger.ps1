@@ -1,6 +1,7 @@
 # scripts/Setup-KernelDebugger.ps1
-# Run on HOST/debugger machine. Optionally installs WinDbg and opens the KDNET
-# firewall port needed to debug the VM/debuggee.
+# Run on the debugger machine. Optionally installs WinDbg and opens the KDNET
+# firewall port needed to debug another VM. Hyper-V firmware switches only work
+# when this is run on the Hyper-V host.
 
 #Requires -RunAsAdministrator
 
@@ -14,7 +15,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string[]]$RemoteAddress = @("LocalSubnet"),
 
-    # VM to prepare for BCDEdit-based kernel debugging.
+    # Hyper-V VM to prepare for BCDEdit-based kernel debugging. Host only.
     [string]$VMName,
 
     # Path to the agent sandbox config used to find the default VM name.
@@ -23,10 +24,13 @@ param(
     # Install WinDbg on this debugger machine via winget.
     [switch]$InstallWinDbg,
 
-    # Turn off VM Secure Boot before running Setup-KernelDebuggee.ps1.
+    # Skip KDNET firewall setup. Useful for Hyper-V-host-only Secure Boot changes.
+    [switch]$SkipFirewall,
+
+    # Turn off VM Secure Boot before running Setup-KernelDebuggee.ps1. Host only.
     [switch]$DisableVmSecureBoot,
 
-    # Turn VM Secure Boot back on after kernel debugging is disabled.
+    # Turn VM Secure Boot back on after kernel debugging is disabled. Host only.
     [switch]$EnableVmSecureBoot,
 
     # Shared KDNET key. If omitted, the script prints a generated key.
@@ -107,12 +111,6 @@ if ($DisableVmSecureBoot -and $EnableVmSecureBoot) {
     throw "Use only one of -DisableVmSecureBoot or -EnableVmSecureBoot."
 }
 
-if (-not $Key) {
-    $Key = New-KdNetKey
-} else {
-    $Key = $Key.ToLowerInvariant()
-}
-
 if ($InstallWinDbg) {
     if (-not (Test-CommandExists -Name "winget")) {
         throw "winget was not found. Install App Installer from Microsoft Store, then rerun this script."
@@ -148,54 +146,65 @@ if ($DisableVmSecureBoot -or $EnableVmSecureBoot) {
     }
 }
 
-$ruleName = "Agent Sandbox KDNET Debugger UDP $Port"
-$existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+if (-not $SkipFirewall) {
+    if (-not $Key) {
+        $Key = New-KdNetKey
+    } else {
+        $Key = $Key.ToLowerInvariant()
+    }
 
-if ($existingRule) {
-    if ($PSCmdlet.ShouldProcess($ruleName, "Update inbound UDP firewall rule")) {
-        foreach ($rule in $existingRule) {
-            Set-NetFirewallRule `
-                -InputObject $rule `
-                -Direction Inbound `
-                -Action Allow `
-                -Enabled True `
-                -Profile Any
+    $ruleName = "Agent Sandbox KDNET Debugger UDP $Port"
+    $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
 
-            $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
-                -Protocol UDP `
-                -LocalPort $Port
+    if ($existingRule) {
+        if ($PSCmdlet.ShouldProcess($ruleName, "Update inbound UDP firewall rule")) {
+            foreach ($rule in $existingRule) {
+                Set-NetFirewallRule `
+                    -InputObject $rule `
+                    -Direction Inbound `
+                    -Action Allow `
+                    -Enabled True `
+                    -Profile Any
 
-            $rule | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter `
-                -RemoteAddress $RemoteAddress
+                $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
+                    -Protocol UDP `
+                    -LocalPort $Port
+
+                $rule | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter `
+                    -RemoteAddress $RemoteAddress
+            }
+
+            Write-Host "Firewall rule updated: $ruleName"
+            Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
         }
+    } elseif ($PSCmdlet.ShouldProcess($ruleName, "Create inbound UDP firewall rule")) {
+        New-NetFirewallRule `
+            -DisplayName $ruleName `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol UDP `
+            -LocalPort $Port `
+            -RemoteAddress $RemoteAddress `
+            -Profile Any | Out-Null
 
-        Write-Host "Firewall rule updated: $ruleName"
+        Write-Host "Firewall rule created: $ruleName"
         Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
     }
-} elseif ($PSCmdlet.ShouldProcess($ruleName, "Create inbound UDP firewall rule")) {
-    New-NetFirewallRule `
-        -DisplayName $ruleName `
-        -Direction Inbound `
-        -Action Allow `
-        -Protocol UDP `
-        -LocalPort $Port `
-        -RemoteAddress $RemoteAddress `
-        -Profile Any | Out-Null
 
-    Write-Host "Firewall rule created: $ruleName"
-    Write-Host "  RemoteAddress: $($RemoteAddress -join ', ')"
+    $windbgCommand = "windbgx -k net:port=$Port,key=$Key"
+
+    Write-Host ""
+    Write-Host "Debugger setup ready."
+    Write-Host ""
+    Write-Host "Use this KDNET key when configuring the debuggee:"
+    Write-Host "  $Key"
+    Write-Host ""
+    Write-Host "Start WinDbg with:"
+    Write-Host "  $windbgCommand"
+    Write-Host ""
+    Write-Host "If windbgx is not on PATH, launch WinDbg from Start and open:"
+    Write-Host "  File > Start debugging > Attach to kernel > NET"
+} else {
+    Write-Host ""
+    Write-Host "KDNET firewall setup skipped."
 }
-
-$windbgCommand = "windbgx -k net:port=$Port,key=$Key"
-
-Write-Host ""
-Write-Host "Debugger setup ready."
-Write-Host ""
-Write-Host "Use this KDNET key when configuring the debuggee:"
-Write-Host "  $Key"
-Write-Host ""
-Write-Host "Start WinDbg with:"
-Write-Host "  $windbgCommand"
-Write-Host ""
-Write-Host "If windbgx is not on PATH, launch WinDbg from Start and open:"
-Write-Host "  File > Start debugging > Attach to kernel > NET"

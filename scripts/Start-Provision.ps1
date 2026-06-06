@@ -70,7 +70,13 @@ Copy-Item -ToSession $session `
           -Destination "C:\Invoke-Provision.ps1"
 Write-Host "  Copied: Invoke-Provision.ps1"
 
-# Copy optional VM-side kernel debuggee setup script
+# Copy optional kernel debugging setup scripts. Setup-KernelDebugger.ps1 is
+# useful when this VM is the debugger for another VM.
+Copy-Item -ToSession $session `
+          -Path "$PSScriptRoot\Setup-KernelDebugger.ps1" `
+          -Destination "C:\Setup-KernelDebugger.ps1"
+Write-Host "  Copied: Setup-KernelDebugger.ps1"
+
 Copy-Item -ToSession $session `
           -Path "$PSScriptRoot\Setup-KernelDebuggee.ps1" `
           -Destination "C:\Setup-KernelDebuggee.ps1"

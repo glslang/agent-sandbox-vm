@@ -91,21 +91,29 @@ codex    # OpenAI Codex CLI
 
 ### Kernel debugging
 
-Kernel debugging uses KDNET between the Hyper-V host/debugger and the VM/debuggee. WinDbg is only needed on the debugger machine.
+Kernel debugging uses KDNET between a debugger machine and a VM/debuggee. The debugger machine can be the Hyper-V host or another VM. WinDbg is only needed on the debugger machine.
 
-Shut down the VM, then on the host/debugger optionally install WinDbg, open the KDNET firewall port, and disable VM Secure Boot so the guest can change BCDEdit debug settings:
-
-```powershell
-.\scripts\Setup-KernelDebugger.ps1 -InstallWinDbg -DisableVmSecureBoot
-```
-
-The firewall rule defaults to `LocalSubnet`; pass `-RemoteAddress <vm-ip-or-cidr>` to restrict it to a specific VM address or subnet. The script prints a KDNET key and the matching WinDbg command. Inside the VM/debuggee, run as Administrator with the host IP and the same key:
+On the debugger machine, optionally install WinDbg and open the KDNET firewall port. If the debugger is a provisioned VM, use the copy at `C:\Setup-KernelDebugger.ps1`; on the repository host, use `.\scripts\Setup-KernelDebugger.ps1`.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -DebuggerHostIp <host-ip> -Key <key>
+powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebugger.ps1 -InstallWinDbg
 ```
 
-Reboot the VM, then start WinDbg on the host with the command printed by either script:
+The firewall rule defaults to `LocalSubnet`; pass `-RemoteAddress <debuggee-ip-or-cidr>` to restrict it to a specific VM address or subnet. The script prints a KDNET key and the matching WinDbg command.
+
+On the Hyper-V host, shut down the debuggee VM and disable Secure Boot so the guest can change BCDEdit debug settings:
+
+```powershell
+.\scripts\Setup-KernelDebugger.ps1 -DisableVmSecureBoot -SkipFirewall
+```
+
+Inside the VM/debuggee, run as Administrator with the debugger machine IP and the same key:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -DebuggerHostIp <debugger-ip> -Key <key>
+```
+
+Reboot the debuggee VM, then start WinDbg on the debugger machine with the command printed by either script:
 
 ```powershell
 windbgx -k net:port=50000,key=<key>
@@ -117,10 +125,10 @@ To disable kernel debugging inside the VM:
 powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -Disable
 ```
 
-After the VM shuts down, Secure Boot can be restored on the host:
+After the debuggee VM shuts down, Secure Boot can be restored on the Hyper-V host:
 
 ```powershell
-.\scripts\Setup-KernelDebugger.ps1 -EnableVmSecureBoot
+.\scripts\Setup-KernelDebugger.ps1 -EnableVmSecureBoot -SkipFirewall
 ```
 
 ### Restore to clean state
