@@ -131,6 +131,7 @@ Credentials are stored as an encrypted `vm-cred.xml` (only readable by the host 
 - Rust stable (`x86_64-pc-windows-msvc`) with clippy and rustfmt
 - Node.js (latest via winget)
 - GitHub CLI (`gh` via winget)
+- TTD command line utility (`Microsoft.TimeTravelDebugging` via winget)
 - Claude Code (`@anthropic-ai/claude-code`) authenticated via OAuth
 - OpenAI Codex CLI (`@openai/codex` via npm)
 
