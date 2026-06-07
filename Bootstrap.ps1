@@ -12,9 +12,13 @@ Write-Host "----------------------------------------------"
 Write-Host ""
 
 # -- Config --
+$defaultVMName = "AgentDevSandbox"
+$vmNameInput = Read-Host "  VM name [$defaultVMName]"
+$vmName = if ([string]::IsNullOrWhiteSpace($vmNameInput)) { $defaultVMName } else { $vmNameInput.Trim() }
+
 $config = @{
-    VMName        = "AgentDevSandbox"
-    VMPath        = "D:\Hyper-V\AgentDevSandbox"
+    VMName        = $vmName
+    VMPath        = "D:\Hyper-V\$vmName"
     SharedDrive   = "D:\Hyper-V\Shared"
     CacheRoot     = "D:\AgentSandboxCache"
     CredPath      = "$env:USERPROFILE\.agent-sandbox"
