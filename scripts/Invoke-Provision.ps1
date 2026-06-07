@@ -1,6 +1,6 @@
 # scripts/Invoke-Provision.ps1
 # Run INSIDE the VM as Administrator after Windows is installed.
-# Installs VS Build Tools, Rust, Node, Claude Code, and enables PSRemoting.
+# Installs VS Build Tools, Rust, Node, TTD, Claude Code, and enables PSRemoting.
 #
 # Expects:
 #   - Internet access (Default Switch must be active)
@@ -26,12 +26,12 @@ function Refresh-Path {
 # -- 0. Execution Policy --
 # Set machine-wide policy so npm-installed .ps1 wrappers (e.g. claude.ps1) run
 # in all future sessions without needing -ExecutionPolicy Bypass each time.
-Write-Host "[1/12] Setting execution policy..."
+Write-Host "[1/13] Setting execution policy..."
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
 Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 
 # -- 1. VS Build Tools --
-Write-Host "[2/12] Installing VS Build Tools..."
+Write-Host "[2/13] Installing VS Build Tools..."
 
 $layoutInstaller = "C:\vs-cache\layout\vs_buildtools.exe"
 $onlineInstaller = "$env:TEMP\vs_buildtools.exe"
@@ -63,7 +63,7 @@ if ($proc.ExitCode -notin 0, 3010) {
 }
 
 # -- 2. Rust (MSVC toolchain) --
-Write-Host "[3/12] Installing Rust..."
+Write-Host "[3/13] Installing Rust..."
 
 Invoke-WebRequest "https://win.rustup.rs/x86_64" -OutFile "$env:TEMP\rustup-init.exe"
 & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
@@ -72,14 +72,14 @@ rustup component add clippy rustfmt
 Write-Host "  Rust installed: $(rustc --version)"
 
 # -- 3. Node.js --
-Write-Host "[4/12] Installing Node.js..."
+Write-Host "[4/13] Installing Node.js..."
 
 winget install --silent --accept-package-agreements --accept-source-agreements OpenJS.NodeJS
 Refresh-Path
 Write-Host "  Node installed: $(node --version)"
 
 # -- 4. Git for Windows (Git Bash) --
-Write-Host "[5/12] Installing Git for Windows..."
+Write-Host "[5/13] Installing Git for Windows..."
 
 winget install --silent --accept-package-agreements --accept-source-agreements Git.Git
 Refresh-Path
@@ -102,20 +102,20 @@ if ($gitBashExe) {
 }
 
 # -- 5b. GitHub CLI --
-Write-Host "[6/12] Installing GitHub CLI..."
+Write-Host "[6/13] Installing GitHub CLI..."
 
 winget install --silent --accept-package-agreements --accept-source-agreements GitHub.cli
 Refresh-Path
 Write-Host "  GitHub CLI installed: $(gh --version | Select-Object -First 1)"
 
 # -- 6. Windows Terminal --
-Write-Host "[7/12] Installing Windows Terminal..."
+Write-Host "[7/13] Installing Windows Terminal..."
 
 winget install --silent --accept-package-agreements --accept-source-agreements Microsoft.WindowsTerminal
 Write-Host "  Windows Terminal installed."
 
 # -- 7. Oh My Posh --
-Write-Host "[8/12] Installing Oh My Posh..."
+Write-Host "[8/13] Installing Oh My Posh..."
 
 winget install --silent --accept-package-agreements --accept-source-agreements "JanDe Jong.OhMyPosh"
 Refresh-Path
@@ -132,22 +132,30 @@ Add-Content -Path $PROFILE -Value 'oh-my-posh init pwsh --config "$env:POSH_THEM
 Write-Host "  Oh My Posh installed (theme: jandedobbeleer, font: CascadiaCode NF)."
 Write-Host "  Themes directory: `$env:POSH_THEMES_PATH -- swap theme by editing `$PROFILE."
 
-# -- 8. Claude Code --
-Write-Host "[9/12] Installing Claude Code..."
+# -- 8. TTD command line utility --
+Write-Host "[9/13] Installing TTD command line utility..."
+
+winget install --silent --accept-package-agreements --accept-source-agreements --id Microsoft.TimeTravelDebugging --exact
+Refresh-Path
+$ttdCommand = Get-Command ttd.exe -ErrorAction Stop
+Write-Host "  TTD installed: $($ttdCommand.Source)"
+
+# -- 9. Claude Code --
+Write-Host "[10/13] Installing Claude Code..."
 
 npm install -g @anthropic-ai/claude-code
 Refresh-Path
 Write-Host "  Claude Code installed: $(claude --version)"
 
-# -- 9. OpenAI Codex CLI --
-Write-Host "[10/12] Installing OpenAI Codex CLI..."
+# -- 10. OpenAI Codex CLI --
+Write-Host "[11/13] Installing OpenAI Codex CLI..."
 
 npm install -g @openai/codex
 Refresh-Path
 Write-Host "  Codex CLI installed: $(codex --version)"
 
-# -- 10. Authenticate --
-Write-Host "[11/12] Authenticating with Claude (optional)..."
+# -- 11. Authenticate --
+Write-Host "[12/13] Authenticating with Claude (optional)..."
 Write-Host "  Skip this step if you are using OpenAI Codex CLI only."
 Write-Host ""
 $reply = Read-Host "  Authenticate with Claude now? [Y/n]"
@@ -159,8 +167,8 @@ if ($reply -eq '' -or $reply -match '^[Yy]') {
     Write-Host "  Skipped. Run 'claude login' inside the VM whenever you need it."
 }
 
-# -- 11. Enable PSRemoting (for artifact extraction from host) --
-Write-Host "[12/12] Enabling PowerShell remoting..."
+# -- 12. Enable PSRemoting (for artifact extraction from host) --
+Write-Host "[13/13] Enabling PowerShell remoting..."
 
 Enable-PSRemoting -Force -SkipNetworkProfileCheck
 Set-Service WinRM -StartupType Automatic
