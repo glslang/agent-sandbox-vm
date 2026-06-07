@@ -16,6 +16,10 @@ $defaultVMName = "AgentDevSandbox"
 $vmNameInput = Read-Host "  VM name [$defaultVMName]"
 $vmName = if ([string]::IsNullOrWhiteSpace($vmNameInput)) { $defaultVMName } else { $vmNameInput.Trim() }
 
+if ($vmName -match '[<>:"/\\|?*]') {
+    throw "VM name cannot contain any of these characters: < > : `" / \ | ? *"
+}
+
 $config = @{
     VMName        = $vmName
     VMPath        = "D:\Hyper-V\$vmName"
