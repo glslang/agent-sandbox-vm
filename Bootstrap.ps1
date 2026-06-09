@@ -133,10 +133,24 @@ Write-Host ""
 Write-Host "[5/6] Install Windows to VM"
 Write-Host "      This applies Windows directly to the VHDX -- no DVD boot needed."
 Write-Host ""
-Write-Host "      You need a Windows 11 ISO. Download via Media Creation Tool:"
-Write-Host "      https://www.microsoft.com/software-download/windows11"
+Write-Host "      You need a Windows ISO. Either supply your own (e.g. Windows 11 via"
+Write-Host "      Media Creation Tool: https://www.microsoft.com/software-download/windows11)"
+Write-Host "      or build one from UUP dump (uupdump.net) -- downloads straight from"
+Write-Host "      Microsoft's update servers. Default build: Windows Server 2025, amd64."
 Write-Host ""
-$isoPath = Read-Host "  Enter full path to your Windows 11 ISO"
+$buildChoice = Read-Host "  Build ISO from UUP dump? (y/N)"
+
+$isoPath = ""
+$uupArgs = $null
+if ($buildChoice.Trim() -match '^[Yy]') {
+    $uupVersion = Read-Host "  Windows version to search for [Windows Server 2025]"
+    $uupArch = Read-Host "  Architecture: amd64, arm64 or x86 [amd64]"
+    $uupArgs = @{}
+    if (-not [string]::IsNullOrWhiteSpace($uupVersion)) { $uupArgs.Version = $uupVersion.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($uupArch)) { $uupArgs.Architecture = $uupArch.Trim() }
+} else {
+    $isoPath = Read-Host "  Enter full path to your Windows ISO"
+}
 
 Write-Host ""
 Write-Host "      Optional: provide an autounattend.xml to skip OOBE prompts."
@@ -144,7 +158,16 @@ Write-Host "      Generate one at: https://schneegans.de/windows/unattend-genera
 Write-Host ""
 $unattendPath = Read-Host "  Enter path to autounattend.xml (or press Enter to skip)"
 
-if (-not (Test-Path $isoPath)) {
+if ($null -ne $uupArgs) {
+    try {
+        $isoPath = & "$PSScriptRoot\scripts\New-UUPDumpISO.ps1" @uupArgs | Select-Object -Last 1
+    } catch {
+        Write-Warning "  UUP dump ISO build failed: $_"
+        Write-Host "  Retry manually with: .\scripts\New-UUPDumpISO.ps1"
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($isoPath) -or -not (Test-Path $isoPath)) {
     Write-Host "  ERROR: ISO not found at '$isoPath'."
     Write-Host "  Run manually once you have the ISO:"
     Write-Host "    .\scripts\Install-Windows.ps1 -ISOPath <path>"
