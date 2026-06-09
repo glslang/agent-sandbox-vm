@@ -71,12 +71,24 @@ if ($BuildId) {
 } else {
     Write-Host "[1/4] Searching UUP dump for '$Version' ($Architecture)..."
     $searchUrl = "$apiBase/listid.php?search=$([uri]::EscapeDataString($Version))&sortByDate=1"
-    $result = (Invoke-RestMethod -Uri $searchUrl -UseBasicParsing).response
+    try {
+        $result = (Invoke-RestMethod -Uri $searchUrl -UseBasicParsing).response
+    } catch {
+        # A search with no matches surfaces as HTTP 400 (SEARCH_NO_RESULTS).
+        throw "UUP dump search for '$Version' failed ($($_.Exception.Message)). Browse https://uupdump.net/known.php for valid names."
+    }
     if ($result.error) {
         throw "UUP dump API error: $($result.error)"
     }
 
-    $builds = @($result.builds.PSObject.Properties.Value) |
+    # The API encodes builds as a JSON object keyed by rank ("0", "1", ...) even
+    # when the keys are sequential; also accept a plain array in case that changes.
+    $allBuilds = if ($result.builds -is [array]) {
+        @($result.builds)
+    } else {
+        @($result.builds.PSObject.Properties.Value)
+    }
+    $builds = $allBuilds |
         Where-Object { $_.arch -eq $Architecture } |
         Sort-Object created -Descending
 
@@ -93,7 +105,11 @@ if ($BuildId) {
 if (-not $Edition) {
     Write-Host "[2/4] Querying available editions..."
     $edUrl = "$apiBase/listeditions.php?lang=$Language&id=$buildUuid"
-    $edResult = (Invoke-RestMethod -Uri $edUrl -UseBasicParsing).response
+    try {
+        $edResult = (Invoke-RestMethod -Uri $edUrl -UseBasicParsing).response
+    } catch {
+        throw "UUP dump edition listing for build $buildUuid (language $Language) failed ($($_.Exception.Message))."
+    }
     if ($edResult.error) {
         throw "UUP dump API error: $($edResult.error)"
     }
