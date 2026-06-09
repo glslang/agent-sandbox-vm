@@ -13,8 +13,13 @@ A PowerShell-based infrastructure toolkit that creates an isolated Hyper-V sandb
 ### First-Time Setup
 
 ```powershell
-# Step 1: Create VM, partition VHDX, apply Windows via DISM (prompts for ISO path)
+# Step 1: Create VM, partition VHDX, apply Windows via DISM
+# (prompts for an ISO path, or optionally builds one from UUP dump)
 .\Bootstrap.ps1
+
+# Optional: build a Windows ISO from UUP dump instead of supplying your own
+.\scripts\New-UUPDumpISO.ps1                       # newest Windows Server 2025, amd64
+.\scripts\New-UUPDumpISO.ps1 -Version "Windows 11, version 25H2" -Architecture arm64
 
 # Step 2: Provision toolchain (run on host — switches network, copies files into VM)
 .\scripts\Start-Provision.ps1
@@ -81,6 +86,7 @@ claude login
 | `Bootstrap.ps1` | Host | One-time setup orchestrator |
 | `scripts/New-AgentVM.ps1` | Host | Creates Gen 2 VM (TPM, Secure Boot, SCSI layout) |
 | `scripts/Install-Windows.ps1` | Host | Applies Windows to VHDX via DISM (bypasses DVD boot) |
+| `scripts/New-UUPDumpISO.ps1` | Host | Optional: builds a Windows ISO from UUP dump (defaults to Windows Server 2025 amd64; `-Version`/`-Architecture`/`-Edition` selectable) |
 | `scripts/Start-Provision.ps1` | Host | Switches to Default Switch, copies VS layout + provisioner into VM |
 | `scripts/Invoke-Provision.ps1` | **VM** | Installs VS Build Tools, Rust (MSVC), Node.js, Claude Code, enables PSRemoting |
 | `scripts/Save-BaseSnapshot.ps1` | Host | Captures `CleanProvisionedBase` checkpoint |

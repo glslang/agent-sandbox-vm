@@ -5,7 +5,7 @@ A fully scripted Hyper-V sandbox for running agent tools on Windows with native 
 ## Requirements
 
 - Windows 10/11 **Pro or Enterprise** (Hyper-V required)
-- A Windows 11 ISO ([Media Creation Tool](https://www.microsoft.com/software-download/windows11))
+- A Windows ISO -- supply your own (e.g. [Media Creation Tool](https://www.microsoft.com/software-download/windows11)) or let Bootstrap build one from [UUP dump](https://uupdump.net) (defaults to Windows Server 2025, amd64)
 - A [Claude Pro subscription](https://claude.ai) (no API key needed) to use Claude Code, and/or an [OpenAI API key](https://platform.openai.com/api-keys) to use Codex CLI — at least one is required
 - ~15 GB free disk space
 - Run everything as **Administrator**
@@ -21,6 +21,14 @@ A fully scripted Hyper-V sandbox for running agent tools on Windows with native 
 ```
 
 This creates the VM, partitions the VHDX, and applies Windows directly via DISM (no DVD boot). Optionally provide an `autounattend.xml` from [schneegans.de](https://schneegans.de/windows/unattend-generator/) to skip OOBE.
+
+When asked for an ISO, you can either point at one you already have or answer `y` to build one from [UUP dump](https://uupdump.net). The build downloads UUP files straight from Microsoft's update servers and compiles them into an ISO (30-90 minutes, ~25 GB of free disk during the build). It defaults to the newest **Windows Server 2025** build on **amd64** (x86_64), and both the version and architecture can be changed at the prompt. The same step is available standalone:
+
+```powershell
+.\scripts\New-UUPDumpISO.ps1                                              # Windows Server 2025, amd64
+.\scripts\New-UUPDumpISO.ps1 -Version "Windows 11, version 25H2" -Architecture arm64
+.\scripts\New-UUPDumpISO.ps1 -BuildId <uuid> -Edition SERVERDATACENTER   # pin an exact build
+```
 
 ### Step 2 -- Complete Windows OOBE
 
@@ -150,6 +158,7 @@ agent-sandbox-vm/
 |-- scripts/
 |   |-- New-AgentVM.ps1        # Creates the Hyper-V VM (Gen 2, TPM, Secure Boot)
 |   |-- Install-Windows.ps1    # Applies Windows to VHDX via DISM (no DVD boot)
+|   |-- New-UUPDumpISO.ps1     # Optional: builds a Windows ISO from UUP dump
 |   |-- Attach-ISO.ps1         # Alternative: boot from DVD if DISM not needed
 |   |-- Start-Provision.ps1    # Host-side: switches network, copies files into VM
 |   |-- Invoke-Provision.ps1   # VM-side: installs toolchain + Claude Code
