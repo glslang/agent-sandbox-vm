@@ -135,7 +135,7 @@ if (Get-VM -Name $config.VMName -ErrorAction SilentlyContinue) {
     & "$PSScriptRoot\scripts\New-AgentVM.ps1" -VMName $config.VMName
     Write-Host "  VM created: $($config.VMName)"
 }
-Ensure-AgentSandboxShare -Config ([pscustomobject]$config)
+Initialize-AgentSandboxShare -Config ([pscustomobject]$config)
 
 # -- Step 5: Install Windows directly to VHDX --
 Write-Host ""

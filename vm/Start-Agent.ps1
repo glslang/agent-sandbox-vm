@@ -3,6 +3,8 @@
 # launches automatically in the right directory when the VM boots.
 # Path inside VM: C:\Users\<user>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\
 
+$ErrorActionPreference = "Stop"
+
 $workspacePath = "C:\workspace"
 $shareName = "AgentSandboxShare"
 $agentSandboxConfigPath = "C:\AgentSandboxVM.json"

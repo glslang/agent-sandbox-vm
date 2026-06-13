@@ -113,6 +113,7 @@ Two modes, switched via `Connect-VMNetworkAdapter`:
 ### Configuration
 
 Bootstrap writes per-VM config to `~/.agent-sandbox/vms/<VMName>/config.json` and also updates `~/.agent-sandbox/config.json` as the current/default VM for commands that omit `-VMName`:
+
 ```json
 {
   "VMName": "AgentDevSandbox",
@@ -124,6 +125,7 @@ Bootstrap writes per-VM config to `~/.agent-sandbox/vms/<VMName>/config.json` an
   "ProjectsRoot": "D:\\workspace"
 }
 ```
+
 Credentials are stored per VM as encrypted `vm-cred.xml` files (only readable by the host Windows user who created them). Legacy `~/.agent-sandbox/vm-cred.xml` remains valid only for migrated legacy-layout configs.
 
 ### VM Spec (set in `New-AgentVM.ps1`)
