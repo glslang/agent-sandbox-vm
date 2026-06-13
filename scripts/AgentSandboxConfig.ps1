@@ -53,14 +53,16 @@ function Get-AgentSandboxShareName {
     )
 
     $safeName = $VMName -replace '[^A-Za-z0-9_.-]', '-'
+    $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($VMName))
+    $hash = -join ($hashBytes[0..3] | ForEach-Object { $_.ToString("x2") })
     $prefix = "AgentSandboxShare-"
     $maxNameLength = 80
-    $maxVmPartLength = $maxNameLength - $prefix.Length
+    $maxVmPartLength = $maxNameLength - $prefix.Length - $hash.Length - 1
     if ($safeName.Length -gt $maxVmPartLength) {
         $safeName = $safeName.Substring(0, $maxVmPartLength)
     }
 
-    "$prefix$safeName"
+    "$prefix$safeName-$hash"
 }
 
 function Add-AgentSandboxConfigMetadata {
@@ -88,7 +90,45 @@ function Add-AgentSandboxConfigMetadata {
     $Config | Add-Member -NotePropertyName ConfigPath -NotePropertyValue $ConfigPath -Force
     $Config | Add-Member -NotePropertyName ConfigDir -NotePropertyValue $configDir -Force
     $Config | Add-Member -NotePropertyName CredentialPath -NotePropertyValue $credentialPath -Force
+    $Config | Add-Member -NotePropertyName IsLegacyConfig -NotePropertyValue ($ConfigPath -eq (Get-AgentSandboxLegacyConfigPath)) -Force
     $Config
+}
+
+function Save-AgentSandboxLegacyConfigSnapshot {
+    param(
+        [string]$SkipVMName = ""
+    )
+
+    $legacyConfigPath = Get-AgentSandboxLegacyConfigPath
+    if (-not (Test-Path $legacyConfigPath)) {
+        return $null
+    }
+
+    $legacyConfig = Get-Content $legacyConfigPath -Raw | ConvertFrom-Json
+    if (-not $legacyConfig.VMName -or ($SkipVMName -and $legacyConfig.VMName -eq $SkipVMName)) {
+        return $null
+    }
+
+    $perVMConfigPath = Get-AgentSandboxConfigPath -VMName $legacyConfig.VMName
+    if (Test-Path $perVMConfigPath) {
+        return $null
+    }
+
+    if (-not $legacyConfig.ShareName) {
+        $legacyConfig | Add-Member -NotePropertyName ShareName -NotePropertyValue "AgentSandboxShare" -Force
+    }
+    if (-not $legacyConfig.CredPath) {
+        $legacyConfig | Add-Member -NotePropertyName CredPath -NotePropertyValue (Get-AgentSandboxRoot) -Force
+    }
+
+    $config = @{}
+    foreach ($property in $legacyConfig.PSObject.Properties) {
+        if ($property.Name -notin @("ConfigPath", "ConfigDir", "CredentialPath", "IsLegacyConfig")) {
+            $config[$property.Name] = $property.Value
+        }
+    }
+
+    Save-AgentSandboxConfig -Config $config
 }
 
 function Resolve-AgentSandboxConfig {
@@ -238,13 +278,6 @@ function Import-AgentSandboxCredential {
         return $cred
     }
 
-    $legacyCredPath = Join-Path (Get-AgentSandboxRoot) "vm-cred.xml"
-    if (Test-Path $legacyCredPath) {
-        $cred = Import-Clixml $legacyCredPath
-        Protect-AgentSandboxPath -Path $legacyCredPath
-        return $cred
-    }
-
     if (-not $PromptIfMissing) {
         throw "VM credentials not found. Run .\scripts\Save-VMCredentials.ps1 -VMName $($Config.VMName)."
     }
@@ -271,4 +304,29 @@ function Save-AgentSandboxCredential {
     $Credential | Export-Clixml -Path $credPath
     Protect-AgentSandboxPath -Path $credPath
     $credPath
+}
+
+function Ensure-AgentSandboxShare {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Config
+    )
+
+    New-Item -ItemType Directory -Force -Path $Config.SharedDrive | Out-Null
+
+    $shareName = $Config.ShareName
+    $existingShare = Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue
+    if ($existingShare -and $existingShare.Path -ne $Config.SharedDrive) {
+        Remove-SmbShare -Name $shareName -Force
+        $existingShare = $null
+    }
+
+    if (-not $existingShare) {
+        New-SmbShare -Name $shareName `
+                     -Path $Config.SharedDrive `
+                     -FullAccess "$env:USERDOMAIN\$env:USERNAME" | Out-Null
+        Write-Host "  SMB share created: \\localhost\$shareName -> $($Config.SharedDrive)"
+    } else {
+        Write-Host "  SMB share ready: \\localhost\$shareName -> $($Config.SharedDrive)"
+    }
 }

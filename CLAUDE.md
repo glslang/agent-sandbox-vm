@@ -118,13 +118,13 @@ Bootstrap writes per-VM config to `~/.agent-sandbox/vms/<VMName>/config.json` an
   "VMName": "AgentDevSandbox",
   "VMPath": "D:\\Hyper-V\\AgentDevSandbox",
   "SharedDrive": "D:\\Hyper-V\\AgentDevSandbox\\Shared",
-  "ShareName": "AgentSandboxShare-AgentDevSandbox",
+  "ShareName": "AgentSandboxShare-AgentDevSandbox-<hash>",
   "CacheRoot": "D:\\AgentSandboxCache",
   "CredPath": "%USERPROFILE%\\.agent-sandbox\\vms\\AgentDevSandbox",
   "ProjectsRoot": "D:\\workspace"
 }
 ```
-Credentials are stored per VM as encrypted `vm-cred.xml` files (only readable by the host Windows user who created them). Legacy `~/.agent-sandbox/vm-cred.xml` is still read as a fallback.
+Credentials are stored per VM as encrypted `vm-cred.xml` files (only readable by the host Windows user who created them). Legacy `~/.agent-sandbox/vm-cred.xml` remains valid only for migrated legacy-layout configs.
 
 ### VM Spec (set in `New-AgentVM.ps1`)
 
