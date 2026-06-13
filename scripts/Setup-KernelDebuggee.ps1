@@ -7,7 +7,7 @@
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "Enable")]
 param(
     # Host/debugger IP reachable from this VM.
-    [Parameter(Mandatory = $true, ParameterSetName = "Enable")]
+    [Parameter(ParameterSetName = "Enable")]
     [ValidateScript({
         $addr = $null
         [System.Net.IPAddress]::TryParse($_, [ref]$addr) -and
@@ -20,7 +20,7 @@ param(
     [ValidateRange(49152, 65535)]
     [int]$Port = 50000,
 
-    # Shared KDNET key. If omitted, the script generates one.
+    # Shared KDNET key printed by Setup-KernelDebugger.ps1 on the debugger machine.
     [Parameter(ParameterSetName = "Enable")]
     [ValidatePattern('^[0-9a-zA-Z]{1,13}(\.[0-9a-zA-Z]{1,13}){3}$')]
     [string]$Key,
@@ -31,27 +31,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
-function New-KdNetKey {
-    $alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
-    $bytes = New-Object byte[] 48
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try {
-        $rng.GetBytes($bytes)
-    } finally {
-        $rng.Dispose()
-    }
-
-    $parts = for ($group = 0; $group -lt 4; $group++) {
-        $chars = for ($i = 0; $i -lt 12; $i++) {
-            $alphabet[$bytes[($group * 12) + $i] % $alphabet.Length]
-        }
-
-        -join $chars
-    }
-
-    $parts -join "."
-}
 
 function Invoke-NativeCommand {
     param(
@@ -86,7 +65,7 @@ function Assert-SecureBootDisabled {
     }
 
     if ($secureBootEnabled) {
-        throw "Secure Boot is enabled. Shut down this VM, run Setup-KernelDebugger.ps1 -DisableVmSecureBoot -SkipFirewall on the Hyper-V host, then rerun this script."
+        throw "Secure Boot is enabled. Shut down this VM, then run .\scripts\Setup-KernelDebugger.ps1 -DisableVmSecureBoot -SkipFirewall on the Hyper-V host from the agent-sandbox-vm repository. Do not run C:\Setup-KernelDebugger.ps1 inside this VM for the Secure Boot change. After that, start the VM and rerun this script."
     }
 }
 
@@ -113,15 +92,19 @@ if ($Disable) {
     exit 0
 }
 
-if (-not $Key) {
-    $Key = New-KdNetKey
-} else {
-    $Key = $Key.ToLowerInvariant()
+Assert-SecureBootDisabled
+
+if (-not $DebuggerHostIp) {
+    throw "DebuggerHostIp is required when enabling kernel debugging. Rerun with -DebuggerHostIp <debugger-ip>."
 }
 
-if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and configure KDNET endpoint")) {
-    Assert-SecureBootDisabled
+if (-not $Key) {
+    throw "Key is required when enabling kernel debugging. Use the KDNET key printed by Setup-KernelDebugger.ps1 on the debugger machine, then rerun with -Key <key>."
+}
 
+$Key = $Key.ToLowerInvariant()
+
+if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and configure KDNET endpoint")) {
     Invoke-NativeCommand `
         -Command "bcdedit" `
         -Arguments @("/debug", "on") `
@@ -132,19 +115,16 @@ if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and config
         -Arguments @("/dbgsettings", "net", "hostip:$DebuggerHostIp", "port:$Port", "key:$Key") `
         -Description "bcdedit /dbgsettings net"
 
-    $windbgCommand = "windbgx -k net:port=$Port,key=$Key"
-
     Write-Host ""
     Write-Host "Kernel debuggee setup ready."
     Write-Host ""
-    Write-Host "Reboot this VM, then start WinDbg on the debugger host with:"
-    Write-Host "  $windbgCommand"
+    Write-Host "Reboot this VM, then start WinDbg on the debugger host with the command printed by Setup-KernelDebugger.ps1."
     Write-Host ""
     Write-Host "Debugger host IP:"
     Write-Host "  $DebuggerHostIp"
     Write-Host ""
-    Write-Host "KDNET key:"
-    Write-Host "  $Key"
+    Write-Host "KDNET port:"
+    Write-Host "  $Port"
 } else {
     Write-Host ""
     Write-Host "Kernel debuggee setup was not applied."

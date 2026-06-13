@@ -50,7 +50,7 @@ This runs **on your host** and:
 Then **inside the VM**, run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Invoke-Provision.ps1
+powershell -ExecutionPolicy RemoteSigned -File C:\Invoke-Provision.ps1
 ```
 
 This installs VS Build Tools, Rust (MSVC), Node.js, Git, GitHub CLI (`gh`), Windows Terminal, Oh My Posh (with CascadiaCode Nerd Font), TTD command line utility, Claude Code, and OpenAI Codex CLI. It then prompts you to authenticate with Claude via OAuth — skip this if you only need Codex CLI.
@@ -106,10 +106,10 @@ Kernel debugging uses KDNET between a debugger machine and a VM/debuggee. The de
 On the debugger machine, optionally install WinDbg and open the KDNET firewall port. If the debugger is a provisioned VM, use the copy at `C:\Setup-KernelDebugger.ps1`; on the repository host, use `.\scripts\Setup-KernelDebugger.ps1`.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebugger.ps1 -InstallWinDbg
+powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebugger.ps1 -InstallWinDbg
 ```
 
-The firewall rule defaults to `LocalSubnet` on `Domain,Private` profiles; pass `-RemoteAddress <debuggee-ip-or-cidr>` to restrict it to a specific VM address or subnet, and `-FirewallProfile Any` only if the debugger intentionally listens on every network profile. If the default UDP port is reserved on the debugger machine, the script fails before creating the rule; rerun with a different `-Port` and use the same value on the debuggee script. The script prints a KDNET key and the matching WinDbg command.
+The firewall rule defaults to `LocalSubnet` on `Domain,Private` profiles; pass `-RemoteAddress <debuggee-ip-or-cidr>` to restrict it to a specific VM address or subnet, and `-FirewallProfile Any` only if the debugger intentionally listens on every network profile. If the default UDP port is reserved on the debugger machine, the script fails before creating the rule; rerun with a different `-Port` and use the same value on the debuggee script. This debugger-host script is the source of truth for the KDNET key and matching WinDbg command.
 
 On the Hyper-V host, shut down the debuggee VM and disable Secure Boot so the guest can change BCDEdit debug settings:
 
@@ -117,13 +117,13 @@ On the Hyper-V host, shut down the debuggee VM and disable Secure Boot so the gu
 .\scripts\Setup-KernelDebugger.ps1 -DisableVmSecureBoot -SkipFirewall
 ```
 
-Inside the VM/debuggee, run as Administrator with the debugger machine IP and the same key:
+Inside the VM/debuggee, run as Administrator with the debugger machine IP and the key printed by `Setup-KernelDebugger.ps1`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -DebuggerHostIp <debugger-ip> -Key <key>
+powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebuggee.ps1 -DebuggerHostIp <debugger-ip> -Key <key>
 ```
 
-Reboot the debuggee VM, then start WinDbg on the debugger machine with the command printed by either script:
+Reboot the debuggee VM, then start WinDbg on the debugger machine with the command printed by `Setup-KernelDebugger.ps1`:
 
 ```powershell
 windbgx -k net:port=50000,key=<key>
@@ -132,7 +132,7 @@ windbgx -k net:port=50000,key=<key>
 To disable kernel debugging inside the VM:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Setup-KernelDebuggee.ps1 -Disable
+powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebuggee.ps1 -Disable
 ```
 
 After the debuggee VM shuts down, Secure Boot can be restored on the Hyper-V host:

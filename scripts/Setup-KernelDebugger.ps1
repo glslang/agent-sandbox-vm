@@ -149,7 +149,7 @@ if ($InstallWinDbg) {
     if ($PSCmdlet.ShouldProcess("Microsoft.WinDbg", "Install WinDbg via winget")) {
         Invoke-NativeCommand `
             -Command "winget" `
-            -Arguments @("install", "--silent", "--accept-package-agreements", "--accept-source-agreements", "Microsoft.WinDbg") `
+            -Arguments @("install", "--id", "Microsoft.WinDbg", "--exact", "--source", "winget", "--silent", "--accept-package-agreements", "--accept-source-agreements") `
             -Description "winget install Microsoft.WinDbg"
     }
 } else {

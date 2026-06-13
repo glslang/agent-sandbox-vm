@@ -9,6 +9,40 @@
 
 $ErrorActionPreference = "Stop"
 
+function Protect-PathForCurrentUser {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $item = Get-Item -LiteralPath $Path
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+
+    foreach ($rule in @($acl.Access)) {
+        $acl.PurgeAccessRules($rule.IdentityReference)
+    }
+
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if ($item.PSIsContainer) {
+        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
+        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
+    } else {
+        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]::None
+        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
+    }
+
+    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $identity,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        $inheritanceFlags,
+        $propagationFlags,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.AddAccessRule($accessRule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
 $configPath = "$env:USERPROFILE\.agent-sandbox\config.json"
 $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
 
@@ -49,13 +83,14 @@ if ($currentSwitch -eq "Default Switch") {
 $credPath = "$env:USERPROFILE\.agent-sandbox\vm-cred.xml"
 if (Test-Path $credPath) {
     $cred = Import-Clixml $credPath
+    Protect-PathForCurrentUser -Path $credPath
 } else {
     Write-Host ""
     Write-Host "  Enter the VM Windows username and password."
     $cred = Get-Credential -Message "VM credentials"
     # Save for later
     $cred | Export-Clixml $credPath
-    & icacls $credPath /inheritance:r /grant:r "${env:USERNAME}:(F)" 2>&1 | Out-Null
+    Protect-PathForCurrentUser -Path $credPath
     Write-Host "  Credentials saved for future use."
 }
 
@@ -113,7 +148,7 @@ Write-Host ""
 Write-Host "----------------------------------------------"
 Write-Host "  In the VM console, run as Administrator:"
 Write-Host ""
-Write-Host "    powershell -ExecutionPolicy Bypass -File C:\Invoke-Provision.ps1"
+Write-Host "    powershell -ExecutionPolicy RemoteSigned -File C:\Invoke-Provision.ps1"
 Write-Host ""
 Write-Host "  After it completes, shut down the VM and run:"
 Write-Host "    .\scripts\Save-BaseSnapshot.ps1"

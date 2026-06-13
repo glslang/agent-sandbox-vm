@@ -5,6 +5,40 @@
 
 $ErrorActionPreference = "Stop"
 
+function Protect-PathForCurrentUser {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $item = Get-Item -LiteralPath $Path
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+
+    foreach ($rule in @($acl.Access)) {
+        $acl.PurgeAccessRules($rule.IdentityReference)
+    }
+
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if ($item.PSIsContainer) {
+        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
+        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
+    } else {
+        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]::None
+        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
+    }
+
+    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $identity,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        $inheritanceFlags,
+        $propagationFlags,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.AddAccessRule($accessRule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
 Write-Host ""
 Write-Host "----------------------------------------------"
 Write-Host "  Agent Sandbox VM -- Bootstrap Setup"
@@ -59,8 +93,7 @@ foreach ($f in $folders) {
 
 # Lock down credentials folder
 $aclTarget = $config.CredPath
-$aclGrant = "${env:USERNAME}:(OI)(CI)F"
-& icacls $aclTarget /inheritance:r /grant:r $aclGrant 2>&1 | Out-Null
+Protect-PathForCurrentUser -Path $aclTarget
 Write-Host "  Locked down: $aclTarget"
 
 # Write config file for other scripts to read

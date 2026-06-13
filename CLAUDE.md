@@ -24,7 +24,7 @@ A PowerShell-based infrastructure toolkit that creates an isolated Hyper-V sandb
 # Step 2: Provision toolchain (run on host — switches network, copies files into VM)
 .\scripts\Start-Provision.ps1
 # Then inside the VM:
-powershell -ExecutionPolicy Bypass -File C:\Invoke-Provision.ps1
+powershell -ExecutionPolicy RemoteSigned -File C:\Invoke-Provision.ps1
 
 # Step 3: Save the clean snapshot (shut down VM first)
 .\scripts\Save-BaseSnapshot.ps1
