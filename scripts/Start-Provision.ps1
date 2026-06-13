@@ -97,49 +97,54 @@ if (Test-Path $credPath) {
 # -- Copy files into VM --
 Write-Host "[2/3] Copying files into VM via PowerShell Direct..."
 
-$session = New-PSSession -VMName $cfg.VMName -Credential $cred
+$session = $null
+try {
+    $session = New-PSSession -VMName $cfg.VMName -Credential $cred
 
-# Copy provision script
-Copy-Item -ToSession $session `
-          -Path "$PSScriptRoot\Invoke-Provision.ps1" `
-          -Destination "C:\Invoke-Provision.ps1"
-Write-Host "  Copied: Invoke-Provision.ps1"
-
-# Copy optional kernel debugging setup scripts. Setup-KernelDebugger.ps1 is
-# useful when this VM is the debugger for another VM.
-Copy-Item -ToSession $session `
-          -Path "$PSScriptRoot\Setup-KernelDebugger.ps1" `
-          -Destination "C:\Setup-KernelDebugger.ps1"
-Write-Host "  Copied: Setup-KernelDebugger.ps1"
-
-Copy-Item -ToSession $session `
-          -Path "$PSScriptRoot\Setup-KernelDebuggee.ps1" `
-          -Destination "C:\Setup-KernelDebuggee.ps1"
-Write-Host "  Copied: Setup-KernelDebuggee.ps1"
-
-# Copy VS Build Tools offline layout if it exists on host
-$vsLayoutPath = "$($cfg.CacheRoot)\vs-layout\layout"
-if (Test-Path "$vsLayoutPath\vs_buildtools.exe") {
-    Write-Host "  Copying VS Build Tools offline layout into VM..."
-    Write-Host "  (This is ~3-4 GB and may take a few minutes)"
-
-    # Create target dir in VM
-    Invoke-Command -Session $session -ScriptBlock {
-        New-Item -ItemType Directory -Force -Path "C:\vs-cache\layout" | Out-Null
-    }
-
-    # Copy the layout folder
+    # Copy provision script
     Copy-Item -ToSession $session `
-              -Path "$vsLayoutPath\*" `
-              -Destination "C:\vs-cache\layout\" `
-              -Recurse -Force
-    Write-Host "  VS Build Tools layout copied."
-} else {
-    Write-Host "  VS Build Tools offline layout not found on host."
-    Write-Host "  The provisioner will download from the internet instead."
-}
+              -Path "$PSScriptRoot\Invoke-Provision.ps1" `
+              -Destination "C:\Invoke-Provision.ps1"
+    Write-Host "  Copied: Invoke-Provision.ps1"
 
-Remove-PSSession $session
+    # Copy optional kernel debugging setup scripts. Setup-KernelDebugger.ps1 is
+    # useful when this VM is the debugger for another VM.
+    Copy-Item -ToSession $session `
+              -Path "$PSScriptRoot\Setup-KernelDebugger.ps1" `
+              -Destination "C:\Setup-KernelDebugger.ps1"
+    Write-Host "  Copied: Setup-KernelDebugger.ps1"
+
+    Copy-Item -ToSession $session `
+              -Path "$PSScriptRoot\Setup-KernelDebuggee.ps1" `
+              -Destination "C:\Setup-KernelDebuggee.ps1"
+    Write-Host "  Copied: Setup-KernelDebuggee.ps1"
+
+    # Copy VS Build Tools offline layout if it exists on host
+    $vsLayoutPath = "$($cfg.CacheRoot)\vs-layout\layout"
+    if (Test-Path "$vsLayoutPath\vs_buildtools.exe") {
+        Write-Host "  Copying VS Build Tools offline layout into VM..."
+        Write-Host "  (This is ~3-4 GB and may take a few minutes)"
+
+        # Create target dir in VM
+        Invoke-Command -Session $session -ScriptBlock {
+            New-Item -ItemType Directory -Force -Path "C:\vs-cache\layout" | Out-Null
+        }
+
+        # Copy the layout folder
+        Copy-Item -ToSession $session `
+                  -Path "$vsLayoutPath\*" `
+                  -Destination "C:\vs-cache\layout\" `
+                  -Recurse -Force
+        Write-Host "  VS Build Tools layout copied."
+    } else {
+        Write-Host "  VS Build Tools offline layout not found on host."
+        Write-Host "  The provisioner will download from the internet instead."
+    }
+} finally {
+    if ($session) {
+        Remove-PSSession $session
+    }
+}
 
 # -- Open console --
 Write-Host ""

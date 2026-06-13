@@ -1,6 +1,8 @@
 # scripts/Save-VMCredentials.ps1
 # Run once on host. Saves VM login credentials securely for unattended artifact extraction.
 
+$ErrorActionPreference = "Stop"
+
 function Protect-PathForCurrentUser {
     param(
         [Parameter(Mandatory = $true)]
@@ -36,6 +38,8 @@ function Protect-PathForCurrentUser {
 }
 
 $credPath = "$env:USERPROFILE\.agent-sandbox\vm-cred.xml"
+$credDir = Split-Path -Path $credPath -Parent
+New-Item -ItemType Directory -Force -Path $credDir | Out-Null
 
 Write-Host "Enter the username and password for the VM Windows account."
 Write-Host "(This is the account you created during Windows setup inside the VM.)"
