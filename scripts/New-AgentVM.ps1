@@ -9,6 +9,7 @@ param(
     [string]$VMName = ""
 )
 
+$ErrorActionPreference = "Stop"
 . "$PSScriptRoot\AgentSandboxConfig.ps1"
 
 $cfg = Resolve-AgentSandboxConfig -VMName $VMName
@@ -71,7 +72,7 @@ Write-Host "  DVD controller: $((Get-VMDvdDrive -VMName $cfg.VMName).ControllerN
 Enable-VMIntegrationService -VMName $cfg.VMName -Name "Guest Service Interface"
 
 # SMB share (handy for file drops before PSRemoting is up)
-Ensure-AgentSandboxShare -Config $cfg
+Initialize-AgentSandboxShare -Config $cfg
 
 Write-Host "  VM '$($cfg.VMName)' created successfully."
 Write-Host "  Secure Boot: On (MicrosoftWindows template)"

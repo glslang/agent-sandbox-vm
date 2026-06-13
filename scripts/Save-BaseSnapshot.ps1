@@ -8,6 +8,7 @@ param(
     [string]$VMName = ""
 )
 
+$ErrorActionPreference = "Stop"
 . "$PSScriptRoot\AgentSandboxConfig.ps1"
 
 $cfg = Resolve-AgentSandboxConfig -VMName $VMName -RequireVM

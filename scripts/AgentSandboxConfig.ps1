@@ -1,5 +1,7 @@
 # Shared config helpers for host-side Agent Sandbox scripts.
 
+$ErrorActionPreference = "Stop"
+
 function Get-AgentSandboxRoot {
     Join-Path $env:USERPROFILE ".agent-sandbox"
 }
@@ -53,7 +55,12 @@ function Get-AgentSandboxShareName {
     )
 
     $safeName = $VMName -replace '[^A-Za-z0-9_.-]', '-'
-    $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($VMName))
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($VMName))
+    } finally {
+        $sha256.Dispose()
+    }
     $hash = -join ($hashBytes[0..3] | ForEach-Object { $_.ToString("x2") })
     $prefix = "AgentSandboxShare-"
     $maxNameLength = 80
@@ -306,7 +313,7 @@ function Save-AgentSandboxCredential {
     $credPath
 }
 
-function Ensure-AgentSandboxShare {
+function Initialize-AgentSandboxShare {
     param(
         [Parameter(Mandatory = $true)]
         [pscustomobject]$Config
