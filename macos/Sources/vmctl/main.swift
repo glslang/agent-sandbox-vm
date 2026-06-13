@@ -1087,10 +1087,14 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
 /// (where a stale PID could match an unrelated `vmctl` running a different VM)
 /// and to stale pidfiles left behind by a crash.
 final class RunLock {
-    private let fd: Int32
+    private var fd: Int32
 
     private init(fd: Int32) {
         self.fd = fd
+    }
+
+    deinit {
+        release()
     }
 
     /// Acquires the lock for `pidURL`, recording the current PID, or returns nil
@@ -1107,10 +1111,13 @@ final class RunLock {
         return RunLock(fd: fd)
     }
 
-    /// Releases the lock. The kernel also releases it automatically on exit.
+    /// Releases the lock. Idempotent — safe to call more than once. The kernel
+    /// also releases it automatically on process exit.
     func release() {
+        guard fd >= 0 else { return }
         flock(fd, LOCK_UN)
         close(fd)
+        fd = -1
     }
 }
 
