@@ -141,6 +141,42 @@ Credentials are stored as an encrypted `vm-cred.xml` (only readable by the host 
 - Claude Code (`@anthropic-ai/claude-code`) authenticated via OAuth
 - OpenAI Codex CLI (`@openai/codex` via npm)
 
+## macOS Host (Experimental)
+
+`macos/` is a separate, experimental implementation for Apple Silicon hosts backed by
+`Virtualization.framework`. It is **not** feature-equivalent to the Hyper-V workflow: macOS guests
+(installed from Apple IPSW restore images) are the supported path, and Windows guests are limited
+because Apple exposes no Windows IPSW install, PowerShell Direct, Hyper-V checkpoints, or vTPM. See
+`macos/README.md` for the full story.
+
+### Components
+
+| Script | Where It Runs | Purpose |
+|--------|---------------|---------|
+| `macos/Sources/vmctl/main.swift` | Host | The `vmctl` Swift CLI — all VM logic (create/install/run/stop/snapshot/copy-out/list/delete) |
+| `macos/scripts/vmctl.sh` | Host | Wrapper that rebuilds + re-signs `vmctl` on demand, then execs it — **all other scripts go through this** |
+| `macos/scripts/Build-vmctl.sh` | Host | `swift build -c release` + ad-hoc `codesign` with `vmctl.entitlements` |
+| `macos/scripts/Bootstrap.sh` | Host | `create` (+ optional `install`) orchestrator |
+| `macos/scripts/New-AgentVM.sh` | Host | Thin alias for `vmctl create` |
+| `macos/scripts/Install-Guest.sh` | Host | Thin alias for `vmctl install` |
+| `macos/scripts/Start-Session.sh` | Host | Restore/sync project into the shared dir/`vmctl run` |
+| `macos/scripts/Save-BaseSnapshot.sh` | Host | Thin alias for `vmctl snapshot save` |
+| `macos/scripts/Copy-Artifacts.sh` | Host | Thin alias for `vmctl copy-out` |
+
+### Conventions
+
+- VM bundles live at `~/.agent-sandbox/macos-vms/<name>.agentvm/` (override the root with the
+  `AGENT_SANDBOX_VM_ROOT` env var). A bundle holds `config.json`, `Disk.raw`, VZ platform metadata,
+  `Shared/` (host↔guest VirtioFS), `Snapshots/`, and `run.pid` while running.
+- Host↔guest transfer is via the VirtioFS shared directory (`Shared/workspace`), mounted in a macOS
+  guest at `/Volumes/My Shared Files/workspace`. There is no PowerShell Direct equivalent.
+- Snapshots are file copies of the bundle's disk/metadata into `Snapshots/<label>/` (cheap via APFS
+  cloning); save/restore refuse while the VM is running.
+- The binary must be code-signed with the `com.apple.security.virtualization` entitlement; bridged
+  networking additionally needs `com.apple.vm.networking` under a real signing identity (ad-hoc
+  signing only covers NAT/isolated).
+- Don't call `swift build` or `vmctl` directly in scripts — go through `macos/scripts/vmctl.sh`.
+
 ## Conventions
 
 - All scripts use `$ErrorActionPreference = "Stop"` — any uncaught error aborts execution.
