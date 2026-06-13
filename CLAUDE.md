@@ -175,7 +175,7 @@ because Apple exposes no Windows IPSW install, PowerShell Direct, Hyper-V checkp
 - The binary must be code-signed with the `com.apple.security.virtualization` entitlement; bridged
   networking additionally needs `com.apple.vm.networking` under a real signing identity (ad-hoc
   signing only covers NAT/isolated).
-- Don't call `swift build` or `vmctl` directly in scripts — go through `macos/scripts/vmctl.sh`.
+- `macos/scripts/Build-vmctl.sh` is the **single** sanctioned place that runs `swift build` + `codesign`; `vmctl.sh` invokes it on demand. Other scripts must not call `swift build` or the `vmctl` binary directly — they go through `macos/scripts/vmctl.sh`.
 
 ## Conventions
 

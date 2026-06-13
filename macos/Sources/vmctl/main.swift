@@ -3,6 +3,8 @@ import Darwin
 import Foundation
 @preconcurrency import Virtualization
 
+/// Error categories surfaced to the user; the associated string is printed as
+/// the CLI's error message.
 enum VMToolError: LocalizedError {
     case usage(String)
     case unsupported(String)
@@ -22,17 +24,20 @@ enum VMToolError: LocalizedError {
     }
 }
 
+/// The kind of guest OS a bundle hosts, selecting the boot/platform path.
 enum GuestKind: String, Codable {
     case macos
     case windows
 }
 
+/// Guest networking mode chosen at `run` time.
 enum NetworkMode: String {
     case isolated
     case nat
     case bridged
 }
 
+/// Persisted per-VM metadata, stored as `config.json` inside the bundle.
 struct VMConfig: Codable {
     var bundleVersion: Int = 1
     var name: String
@@ -49,6 +54,7 @@ struct VMConfig: Codable {
     var notes: [String]
 }
 
+/// Computed locations of the files that make up a single VM bundle.
 struct VMPaths {
     let bundleURL: URL
 
@@ -63,9 +69,12 @@ struct VMPaths {
     var runPIDURL: URL { bundleURL.appendingPathComponent("run.pid") }
 }
 
+/// The directory that holds all VM bundles, rooted at
+/// `~/.agent-sandbox/macos-vms` or the `AGENT_SANDBOX_VM_ROOT` override.
 struct VMStore {
     let rootURL: URL
 
+    /// Returns the store root, honoring the `AGENT_SANDBOX_VM_ROOT` override.
     static func `default`() throws -> VMStore {
         if let override = ProcessInfo.processInfo.environment["AGENT_SANDBOX_VM_ROOT"], !override.isEmpty {
             return VMStore(rootURL: URL(fileURLWithPath: override).standardizedFileURL)
@@ -75,15 +84,19 @@ struct VMStore {
         return VMStore(rootURL: home.appendingPathComponent(".agent-sandbox/macos-vms", isDirectory: true))
     }
 
+    /// Resolves the bundle paths for the VM named `name`.
     func paths(for name: String) -> VMPaths {
         VMPaths(bundleURL: rootURL.appendingPathComponent("\(name).agentvm", isDirectory: true))
     }
 
+    /// Creates the store root directory if it does not yet exist.
     func ensureRoot() throws {
         try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
     }
 }
 
+/// A minimal `--key value` / `--flag` command-line parser shared by all
+/// subcommands.
 struct Options {
     private var values: [String: [String]] = [:]
     private var flags: Set<String> = []
@@ -107,10 +120,12 @@ struct Options {
         }
     }
 
+    /// The last value supplied for `--key`, or nil if absent.
     func string(_ key: String) -> String? {
         values[key]?.last
     }
 
+    /// The value for `--key`, throwing a usage error if missing or empty.
     func required(_ key: String) throws -> String {
         guard let value = string(key), !value.isEmpty else {
             throw VMToolError.usage("Missing required option --\(key)")
@@ -118,6 +133,7 @@ struct Options {
         return value
     }
 
+    /// A positive integer value for `--key`, or `defaultValue` if absent.
     func int(_ key: String, default defaultValue: Int) throws -> Int {
         guard let value = string(key) else { return defaultValue }
         guard let parsed = Int(value), parsed > 0 else {
@@ -126,13 +142,17 @@ struct Options {
         return parsed
     }
 
+    /// Whether the boolean flag `--key` was present.
     func bool(_ key: String) -> Bool {
         flags.contains(key)
     }
 }
 
+/// Program entry point and subcommand dispatcher.
 @main
 struct VMCTL {
+    /// Parses `CommandLine.arguments`, dispatches the subcommand, and maps any
+    /// thrown error to a stderr message + non-zero exit.
     static func main() {
         do {
             try run(Array(CommandLine.arguments.dropFirst()))
@@ -142,6 +162,7 @@ struct VMCTL {
         }
     }
 
+    /// Routes `args` to the matching subcommand handler.
     static func run(_ args: [String]) throws {
         guard let command = args.first else {
             printUsage()
@@ -177,6 +198,7 @@ struct VMCTL {
         }
     }
 
+    /// Prints the command reference.
     static func printUsage() {
         print("""
         vmctl - macOS Virtualization.framework helper for Agent Sandbox VM
@@ -203,6 +225,8 @@ struct VMCTL {
 // MARK: - Commands
 
 extension VMCTL {
+    /// `create`: provisions a new VM bundle (raw disk, platform metadata,
+    /// `config.json`) for a macOS or Windows guest. Does not install an OS.
     static func create(_ options: Options) throws {
         guard let guest = GuestKind(rawValue: try options.required("guest")) else {
             throw VMToolError.usage("--guest must be macos or windows")
@@ -247,6 +271,8 @@ extension VMCTL {
         print("Shared directory: \(paths.sharedURL.path)")
     }
 
+    /// `install`: restores macOS into the bundle's disk from its IPSW. Windows
+    /// installation is unsupported and fails with an explanation.
     static func install(_ options: Options) throws {
         let name = try validateName(options.required("name"))
         let store = try VMStore.default()
@@ -265,6 +291,8 @@ extension VMCTL {
         }
     }
 
+    /// `run`: boots the VM in a window, holding the run lock for the session.
+    /// Refuses if the guest OS is not installed or the VM is already running.
     static func runVM(_ options: Options) throws {
         let name = try validateName(options.required("name"))
         guard let networkMode = NetworkMode(rawValue: options.string("internet") ?? "isolated") else {
@@ -290,21 +318,35 @@ extension VMCTL {
         )
 
         try validate(vmConfig)
-        try "\(getpid())\n".write(to: paths.runPIDURL, atomically: true, encoding: .utf8)
-        let app = RunApp(paths: paths, vmConfiguration: vmConfig, title: "\(config.name) (\(config.guest.rawValue))")
+
+        // Claim the run lock before starting; if another instance already holds
+        // it the VM is running, and we must not overwrite its pidfile.
+        guard let runLock = RunLock.acquire(at: paths.runPIDURL) else {
+            throw VMToolError.invalidState("VM '\(name)' is already running.")
+        }
+
+        let app = RunApp(
+            paths: paths,
+            vmConfiguration: vmConfig,
+            title: "\(config.name) (\(config.guest.rawValue))",
+            runLock: runLock
+        )
         withExtendedLifetime(app) {
             app.start()
         }
     }
 
+    /// `stop`: requests shutdown of a running VM by signaling its `run` process.
     static func stop(_ options: Options) throws {
         let name = try validateName(options.required("name"))
         let store = try VMStore.default()
         let paths = store.paths(for: name)
-        guard let pid = runningVMCTLPID(at: paths.runPIDURL) else {
-            try? FileManager.default.removeItem(at: paths.runPIDURL)
+        guard isVMRunning(pidURL: paths.runPIDURL) else {
             print("VM '\(name)' is not running.")
             return
+        }
+        guard let pid = recordedPID(at: paths.runPIDURL) else {
+            throw VMToolError.invalidState("VM '\(name)' is running but its pidfile is unreadable.")
         }
 
         if kill(pid, SIGTERM) == 0 {
@@ -314,6 +356,8 @@ extension VMCTL {
         }
     }
 
+    /// `snapshot save|restore`: copies the bundle's disk/metadata to or from a
+    /// labeled snapshot directory. Refuses while the VM is running.
     static func snapshot(_ args: [String]) throws {
         guard let action = args.first else {
             throw VMToolError.usage("snapshot requires save or restore")
@@ -337,13 +381,22 @@ extension VMCTL {
         }
     }
 
+    /// `copy-out`: copies a file (or a directory's contents) from the bundle's
+    /// shared directory to a host path. `--from` is constrained to the share.
     static func copyOut(_ options: Options) throws {
         let name = try validateName(options.required("name"))
         let from = try options.required("from")
         let to = URL(fileURLWithPath: try options.required("to")).standardizedFileURL
         let store = try VMStore.default()
         let paths = store.paths(for: name)
-        let source = paths.sharedURL.appendingPathComponent(from)
+        let source = paths.sharedURL.appendingPathComponent(from).standardizedFileURL
+
+        // Keep --from inside the shared directory; standardizing above collapses
+        // any ".." so a traversal like "../../Disk.raw" is rejected here.
+        let sharedRoot = paths.sharedURL.standardizedFileURL.path
+        guard source.path == sharedRoot || source.path.hasPrefix(sharedRoot + "/") else {
+            throw VMToolError.usage("--from must stay within the shared directory")
+        }
 
         guard FileManager.default.fileExists(atPath: source.path) else {
             throw VMToolError.notFound("Shared path does not exist: \(source.path)")
@@ -364,6 +417,8 @@ extension VMCTL {
         print("Copied from shared VM directory to \(to.path)")
     }
 
+    /// `list`: prints each bundle's name, guest kind, install state, and whether
+    /// it is currently running.
     static func list(_ options: Options) throws {
         let store = try VMStore.default()
         let bundles = (try? FileManager.default.contentsOfDirectory(at: store.rootURL, includingPropertiesForKeys: nil))?
@@ -383,11 +438,12 @@ extension VMCTL {
                 print("\(name)\t?\t?\t(unreadable config)")
                 continue
             }
-            let state = runningVMCTLPID(at: paths.runPIDURL) != nil ? "running" : "stopped"
+            let state = isVMRunning(pidURL: paths.runPIDURL) ? "running" : "stopped"
             print("\(name)\t\(config.guest.rawValue)\t\(config.installed)\t\(state)")
         }
     }
 
+    /// `delete`: removes a VM bundle from disk. Refuses while it is running.
     static func delete(_ options: Options) throws {
         let name = try validateName(options.required("name"))
         let store = try VMStore.default()
@@ -395,13 +451,14 @@ extension VMCTL {
         guard FileManager.default.fileExists(atPath: paths.bundleURL.path) else {
             throw VMToolError.notFound("VM bundle not found: \(paths.bundleURL.path)")
         }
-        if runningVMCTLPID(at: paths.runPIDURL) != nil {
+        if isVMRunning(pidURL: paths.runPIDURL) {
             throw VMToolError.invalidState("VM '\(name)' appears to be running. Stop it before deleting.")
         }
         try FileManager.default.removeItem(at: paths.bundleURL)
         print("Deleted VM bundle: \(paths.bundleURL.path)")
     }
 
+    /// `path`: prints the bundle directory, or its shared directory with `--shared`.
     static func path(_ options: Options) throws {
         let name = try validateName(options.required("name"))
         let store = try VMStore.default()
@@ -409,6 +466,7 @@ extension VMCTL {
         print((options.bool("shared") ? paths.sharedURL : paths.bundleURL).path)
     }
 
+    /// `info`: prints the VM's `config.json` as pretty-printed JSON.
     static func info(_ options: Options) throws {
         let name = try validateName(options.required("name"))
         let store = try VMStore.default()
@@ -422,6 +480,8 @@ extension VMCTL {
 // MARK: - VM Creation
 
 extension VMCTL {
+    /// Validates the macOS restore image and writes the hardware model, machine
+    /// identifier, and auxiliary storage into the bundle, updating `config`.
     static func createMacMetadata(options: Options, paths: VMPaths, config: inout VMConfig) throws {
         #if arch(arm64)
         let restoreURL: URL
@@ -467,6 +527,8 @@ extension VMCTL {
         #endif
     }
 
+    /// Records the Windows installer media path and creates the EFI variable
+    /// store, noting the experimental limitations in `config`.
     static func createWindowsMetadata(options: Options, paths: VMPaths, config: inout VMConfig) throws {
         let installer = URL(fileURLWithPath: try options.required("iso")).standardizedFileURL
         guard FileManager.default.fileExists(atPath: installer.path) else {
@@ -485,6 +547,8 @@ extension VMCTL {
 
 // MARK: - Virtualization Configuration
 
+/// Builds the VZ configuration for a bundle, dispatching to the macOS
+/// hardware-backed path or the generic EFI path by guest kind.
 func buildVirtualMachineConfiguration(
     paths: VMPaths,
     config stored: VMConfig,
@@ -500,6 +564,8 @@ func buildVirtualMachineConfiguration(
     }
 }
 
+/// Builds a macOS guest configuration with the Mac platform, boot loader,
+/// virtio block disk, devices, and an optional VirtioFS shared directory.
 func buildMacConfiguration(
     paths: VMPaths,
     stored: VMConfig,
@@ -546,6 +612,8 @@ func buildMacConfiguration(
     #endif
 }
 
+/// Builds a generic EFI guest configuration (used for Windows ARM64): EFI boot
+/// loader, NVMe disk, optional USB installer media, and USB input devices.
 func buildGenericEFIConfiguration(
     paths: VMPaths,
     stored: VMConfig,
@@ -585,6 +653,7 @@ func buildGenericEFIConfiguration(
     return configuration
 }
 
+/// A virtio block storage device backed by the disk image at `url`.
 func virtioBlockDevice(url: URL, readOnly: Bool) throws -> VZVirtioBlockDeviceConfiguration {
     let attachment = try VZDiskImageStorageDeviceAttachment(
         url: url,
@@ -595,6 +664,7 @@ func virtioBlockDevice(url: URL, readOnly: Bool) throws -> VZVirtioBlockDeviceCo
     return VZVirtioBlockDeviceConfiguration(attachment: attachment)
 }
 
+/// An NVMe storage device backed by the disk image at `url`.
 func nvmeDevice(url: URL, readOnly: Bool) throws -> VZNVMExpressControllerDeviceConfiguration {
     let attachment = try VZDiskImageStorageDeviceAttachment(
         url: url,
@@ -605,6 +675,7 @@ func nvmeDevice(url: URL, readOnly: Bool) throws -> VZNVMExpressControllerDevice
     return VZNVMExpressControllerDeviceConfiguration(attachment: attachment)
 }
 
+/// A USB mass-storage device backed by the disk image at `url` (installer media).
 func usbMassStorageDevice(url: URL, readOnly: Bool) throws -> VZUSBMassStorageDeviceConfiguration {
     let attachment = try VZDiskImageStorageDeviceAttachment(
         url: url,
@@ -615,6 +686,8 @@ func usbMassStorageDevice(url: URL, readOnly: Bool) throws -> VZUSBMassStorageDe
     return VZUSBMassStorageDeviceConfiguration(attachment: attachment)
 }
 
+/// Builds the network devices for the chosen mode (none/NAT/bridged), resolving
+/// the bridged interface by identifier when one is given.
 func networkDevices(mode: NetworkMode, bridgeInterface: String?) throws -> [VZNetworkDeviceConfiguration] {
     switch mode {
     case .isolated:
@@ -640,6 +713,7 @@ func networkDevices(mode: NetworkMode, bridgeInterface: String?) throws -> [VZNe
     }
 }
 
+/// A 1080p Mac graphics device for macOS guests.
 func macGraphics() -> VZMacGraphicsDeviceConfiguration {
     let graphics = VZMacGraphicsDeviceConfiguration()
     graphics.displays = [
@@ -648,6 +722,7 @@ func macGraphics() -> VZMacGraphicsDeviceConfiguration {
     return graphics
 }
 
+/// A 1080p virtio graphics device for generic EFI guests.
 func virtioGraphics() -> VZVirtioGraphicsDeviceConfiguration {
     let graphics = VZVirtioGraphicsDeviceConfiguration()
     graphics.scanouts = [
@@ -656,6 +731,7 @@ func virtioGraphics() -> VZVirtioGraphicsDeviceConfiguration {
     return graphics
 }
 
+/// Validates a VZ configuration, throwing if the host rejects it.
 func validate(_ configuration: VZVirtualMachineConfiguration) throws {
     try configuration.validate()
 }
@@ -663,6 +739,8 @@ func validate(_ configuration: VZVirtualMachineConfiguration) throws {
 // MARK: - macOS Restore/Install
 
 extension VMCTL {
+    /// Runs `VZMacOSInstaller` to restore macOS into the bundle's disk, printing
+    /// progress, and marks the config installed on success.
     static func installMacOS(paths: VMPaths, config: inout VMConfig) throws {
         #if arch(arm64)
         guard let restoreImagePath = config.restoreImagePath else {
@@ -725,6 +803,7 @@ extension VMCTL {
 }
 
 #if arch(arm64)
+/// Loads restore-image metadata from a local IPSW (synchronously).
 func loadRestoreImage(from url: URL) throws -> VZMacOSRestoreImage {
     let semaphore = DispatchSemaphore(value: 0)
     final class Box: @unchecked Sendable {
@@ -751,6 +830,8 @@ func loadRestoreImage(from url: URL) throws -> VZMacOSRestoreImage {
     return image
 }
 
+/// Fetches metadata for the latest supported restore image and downloads it
+/// (with progress) into `cacheRoot`, reusing a cached copy when present.
 func fetchLatestRestoreImage(cacheRoot: URL) throws -> URL {
     let semaphore = DispatchSemaphore(value: 0)
     final class Box: @unchecked Sendable {
@@ -830,6 +911,9 @@ func fetchLatestRestoreImage(cacheRoot: URL) throws -> URL {
 
 // MARK: - GUI Runner
 
+/// Hosts the running VM in an AppKit window, owns the run lock for the session,
+/// and coordinates graceful shutdown (window close / signal → guest stop request
+/// → forced stop) before terminating the process.
 final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtualMachineDelegate {
     private let paths: VMPaths
     private let vmConfiguration: VZVirtualMachineConfiguration
@@ -839,13 +923,16 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
     private var termSource: DispatchSourceSignal?
     private var intSource: DispatchSourceSignal?
     private var stopRequested = false
+    private let runLock: RunLock
 
-    init(paths: VMPaths, vmConfiguration: VZVirtualMachineConfiguration, title: String) {
+    init(paths: VMPaths, vmConfiguration: VZVirtualMachineConfiguration, title: String, runLock: RunLock) {
         self.paths = paths
         self.vmConfiguration = vmConfiguration
         self.title = title
+        self.runLock = runLock
     }
 
+    /// Configures and runs the AppKit application (blocks until termination).
     func start() {
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
@@ -853,6 +940,7 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
         app.run()
     }
 
+    /// Builds the VM view/window, installs signal handlers, and starts the VM.
     func applicationDidFinishLaunching(_ notification: Notification) {
         let view = VZVirtualMachineView(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
         view.capturesSystemKeys = true
@@ -891,11 +979,13 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
         }
     }
 
+    /// Intercepts app termination to request a graceful guest shutdown first.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         requestStop()
         return .terminateLater
     }
 
+    /// Window close requests a guest shutdown; a second close forces it.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         // First close requests a graceful guest shutdown; the window stays open
         // until the guest actually stops (guestDidStop terminates the app). A
@@ -909,15 +999,18 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
         return false
     }
 
+    /// Guest stopped cleanly — tear down and exit.
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         cleanupAndTerminate()
     }
 
+    /// Guest stopped with an error — report it, then tear down and exit.
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         FileHandle.standardError.write(Data("VM stopped with error: \(error.localizedDescription)\n".utf8))
         cleanupAndTerminate()
     }
 
+    /// Routes SIGTERM/SIGINT into a graceful stop on the main queue.
     private func installSignalHandlers() {
         signal(SIGTERM, SIG_IGN)
         signal(SIGINT, SIG_IGN)
@@ -931,6 +1024,7 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
         intSource?.resume()
     }
 
+    /// Asks the guest to shut down gracefully, falling back to a force stop.
     private func requestStop() {
         stopRequested = true
         guard let vm = virtualMachine else {
@@ -952,6 +1046,7 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
         }
     }
 
+    /// Forcibly stops the VM if it is still running, then tears down.
     private func forceStopIfNeeded() {
         guard let vm = virtualMachine else {
             cleanupAndTerminate()
@@ -973,7 +1068,9 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
         }
     }
 
+    /// Releases the run lock, removes the pidfile, and terminates the process.
     private func cleanupAndTerminate() {
+        runLock.release()
         try? FileManager.default.removeItem(at: paths.runPIDURL)
         NSApplication.shared.reply(toApplicationShouldTerminate: true)
         NSApplication.shared.terminate(nil)
@@ -982,28 +1079,71 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
 
 // MARK: - Process Helpers
 
-/// Returns the PID recorded in the pidfile only if it belongs to a live `vmctl`
-/// process. A dead PID, a recycled PID owned by some unrelated process, or a
-/// missing pidfile all yield nil so callers don't signal or block on stale state.
-func runningVMCTLPID(at pidURL: URL) -> Int32? {
-    guard let pidText = try? String(contentsOf: pidURL, encoding: .utf8),
-          let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)),
-          kill(pid, 0) == 0 else {
-        return nil
+/// An exclusive advisory lock (`flock`) on a VM bundle's pidfile, held by the
+/// `run` command for the lifetime of the process. Because the lock is tied to a
+/// specific bundle file and is released automatically by the kernel when the
+/// owning process exits — even on crash — liveness is determined by lock
+/// ownership rather than the recorded PID. That makes it immune to PID reuse
+/// (where a stale PID could match an unrelated `vmctl` running a different VM)
+/// and to stale pidfiles left behind by a crash.
+final class RunLock {
+    private let fd: Int32
+
+    private init(fd: Int32) {
+        self.fd = fd
     }
 
-    var buffer = [UInt8](repeating: 0, count: 4096)
-    let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-    guard length > 0 else { return nil }
-    let path = String(decoding: buffer.prefix(Int(length)), as: UTF8.self)
-    let executable = URL(fileURLWithPath: path).lastPathComponent
-    return executable == "vmctl" ? pid : nil
+    /// Acquires the lock for `pidURL`, recording the current PID, or returns nil
+    /// if another live process already holds it (the VM is already running).
+    static func acquire(at pidURL: URL) -> RunLock? {
+        let fd = open(pidURL.path, O_RDWR | O_CREAT, 0o644)
+        guard fd >= 0 else { return nil }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            return nil
+        }
+        ftruncate(fd, 0)
+        Array("\(getpid())\n".utf8).withUnsafeBytes { _ = pwrite(fd, $0.baseAddress, $0.count, 0) }
+        return RunLock(fd: fd)
+    }
+
+    /// Releases the lock. The kernel also releases it automatically on exit.
+    func release() {
+        flock(fd, LOCK_UN)
+        close(fd)
+    }
+}
+
+/// Reports whether a `run` process currently holds the lock for `pidURL`.
+/// If no one holds it, a leftover pidfile is treated as stale and removed.
+func isVMRunning(pidURL: URL) -> Bool {
+    guard FileManager.default.fileExists(atPath: pidURL.path) else { return false }
+    let fd = open(pidURL.path, O_RDWR)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+        // Nobody held the lock — the pidfile is stale.
+        flock(fd, LOCK_UN)
+        try? FileManager.default.removeItem(at: pidURL)
+        return false
+    }
+    return true
+}
+
+/// Reads the PID recorded in the pidfile. Only meaningful while the VM is
+/// running (the lock holder wrote and still owns it), so callers must gate this
+/// behind `isVMRunning`.
+func recordedPID(at pidURL: URL) -> Int32? {
+    guard let text = try? String(contentsOf: pidURL, encoding: .utf8) else { return nil }
+    return Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
 // MARK: - Snapshot Helpers
 
+/// Copies the bundle's disk and platform metadata into `snapshotURL`, replacing
+/// any existing snapshot at that label. Refuses while the VM is running.
 func saveSnapshot(paths: VMPaths, snapshotURL: URL) throws {
-    if runningVMCTLPID(at: paths.runPIDURL) != nil {
+    if isVMRunning(pidURL: paths.runPIDURL) {
         throw VMToolError.invalidState("VM appears to be running. Stop it before saving a disk snapshot.")
     }
 
@@ -1016,11 +1156,13 @@ func saveSnapshot(paths: VMPaths, snapshotURL: URL) throws {
     }
 }
 
+/// Restores the bundle's disk and platform metadata from `snapshotURL`,
+/// overwriting current state. Refuses while the VM is running.
 func restoreSnapshot(paths: VMPaths, snapshotURL: URL) throws {
     guard FileManager.default.fileExists(atPath: snapshotURL.path) else {
         throw VMToolError.notFound("Snapshot not found: \(snapshotURL.path)")
     }
-    if runningVMCTLPID(at: paths.runPIDURL) != nil {
+    if isVMRunning(pidURL: paths.runPIDURL) {
         throw VMToolError.invalidState("VM appears to be running. Stop it before restoring a disk snapshot.")
     }
 
@@ -1034,6 +1176,7 @@ func restoreSnapshot(paths: VMPaths, snapshotURL: URL) throws {
     }
 }
 
+/// The set of bundle files captured by save/restore.
 func snapshotItems(paths: VMPaths) -> [URL] {
     [
         paths.configURL,
@@ -1047,6 +1190,7 @@ func snapshotItems(paths: VMPaths) -> [URL] {
 
 // MARK: - File Helpers
 
+/// Creates a sparse raw disk image of `sizeBytes` at `url`.
 func createRawDisk(at url: URL, sizeBytes: UInt64) throws {
     FileManager.default.createFile(atPath: url.path, contents: nil)
     let handle = try FileHandle(forWritingTo: url)
@@ -1054,6 +1198,7 @@ func createRawDisk(at url: URL, sizeBytes: UInt64) throws {
     try handle.truncate(atOffset: sizeBytes)
 }
 
+/// Decodes a VM's `config.json`.
 func loadConfig(from url: URL) throws -> VMConfig {
     guard FileManager.default.fileExists(atPath: url.path) else {
         throw VMToolError.notFound("VM config not found: \(url.path)")
@@ -1061,10 +1206,13 @@ func loadConfig(from url: URL) throws -> VMConfig {
     return try JSONDecoder().decode(VMConfig.self, from: Data(contentsOf: url))
 }
 
+/// Writes a VM's `config.json` atomically.
 func saveConfig(_ config: VMConfig, to url: URL) throws {
     try JSONEncoder.pretty.encode(config).write(to: url, options: [.atomic])
 }
 
+/// Validates a VM name (letters, digits, dash, underscore, dot) to keep it a
+/// safe single path component, returning it unchanged on success.
 func validateName(_ name: String) throws -> String {
     let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
     guard !name.isEmpty, name.rangeOfCharacter(from: allowed.inverted) == nil else {
@@ -1073,6 +1221,7 @@ func validateName(_ name: String) throws -> String {
     return name
 }
 
+/// Whether `url` refers to an existing directory.
 func isDirectory(_ url: URL) -> Bool {
     var isDir: ObjCBool = false
     FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
@@ -1090,6 +1239,7 @@ func copyReplacing(_ source: URL, into directory: URL) throws {
 }
 
 extension JSONEncoder {
+    /// A JSON encoder with stable, human-readable output for config files.
     static var pretty: JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
