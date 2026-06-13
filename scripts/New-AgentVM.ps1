@@ -5,12 +5,13 @@
 
 #Requires -RunAsAdministrator
 
-$configPath = "$env:USERPROFILE\.agent-sandbox\config.json"
-if (-not (Test-Path $configPath)) {
-    Write-Error "Config not found at $configPath -- run Bootstrap.ps1 first."
-    exit 1
-}
-$cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+param(
+    [string]$VMName = ""
+)
+
+. "$PSScriptRoot\AgentSandboxConfig.ps1"
+
+$cfg = Resolve-AgentSandboxConfig -VMName $VMName
 
 $VHDPath    = "$($cfg.VMPath)\$($cfg.VMName).vhdx"
 $VHDSizeGB  = 80
@@ -70,12 +71,15 @@ Write-Host "  DVD controller: $((Get-VMDvdDrive -VMName $cfg.VMName).ControllerN
 Enable-VMIntegrationService -VMName $cfg.VMName -Name "Guest Service Interface"
 
 # SMB share (handy for file drops before PSRemoting is up)
-$shareName = "AgentSandboxShare"
-if (-not (Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue)) {
+$shareName = $cfg.ShareName
+$existingShare = Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue
+if (-not $existingShare) {
     New-SmbShare -Name $shareName `
                  -Path $cfg.SharedDrive `
                  -FullAccess "$env:USERDOMAIN\$env:USERNAME" | Out-Null
     Write-Host "  SMB share created: \\localhost\$shareName -> $($cfg.SharedDrive)"
+} elseif ($existingShare.Path -ne $cfg.SharedDrive) {
+    throw "SMB share '$shareName' already points to '$($existingShare.Path)', not '$($cfg.SharedDrive)'."
 }
 
 Write-Host "  VM '$($cfg.VMName)' created successfully."
@@ -83,4 +87,4 @@ Write-Host "  Secure Boot: On (MicrosoftWindows template)"
 Write-Host "  TPM 2.0: Enabled"
 Write-Host ""
 Write-Host "  Next: attach your Windows ISO:"
-Write-Host "    .\scripts\Attach-ISO.ps1 -ISOPath <path to your ISO>"
+Write-Host "    .\scripts\Attach-ISO.ps1 -VMName '$($cfg.VMName)' -ISOPath <path to your ISO>"

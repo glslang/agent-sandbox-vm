@@ -24,6 +24,8 @@ A fully scripted Hyper-V sandbox for running agent tools on Windows with native 
 
 This creates the VM, partitions the VHDX, and applies Windows directly via DISM (no DVD boot). Optionally provide an `autounattend.xml` from [schneegans.de](https://schneegans.de/windows/unattend-generator/) to skip OOBE.
 
+Bootstrap prompts for a VM name. Each VM gets its own config, credentials, and shared folder under `~\.agent-sandbox\vms\<VMName>\`; `~\.agent-sandbox\config.json` remains the current/default VM for commands that omit `-VMName`.
+
 When asked for an ISO, you can either point at one you already have or answer `y` to build one from [UUP dump](https://uupdump.net). The build downloads UUP files straight from Microsoft's update servers and compiles them into an ISO (30-90 minutes, ~25 GB of free disk during the build). It defaults to the newest **Windows Server 2025** build on **amd64** (x86_64), and both the version and architecture can be changed at the prompt. The same step is available standalone:
 
 ```powershell
@@ -39,7 +41,7 @@ If you didn't provide `autounattend.xml`, complete the setup prompts in the VM c
 ### Step 3 -- Provision the VM
 
 ```powershell
-.\scripts\Start-Provision.ps1
+.\scripts\Start-Provision.ps1 -VMName AgentDevSandbox
 ```
 
 This runs **on your host** and:
@@ -60,7 +62,7 @@ This installs VS Build Tools, Rust (MSVC), Node.js, Git, GitHub CLI (`gh`), Wind
 After provisioning completes, **shut down the VM**, then on the host:
 
 ```powershell
-.\scripts\Save-BaseSnapshot.ps1
+.\scripts\Save-BaseSnapshot.ps1 -VMName AgentDevSandbox
 ```
 
 ---
@@ -71,16 +73,16 @@ After provisioning completes, **shut down the VM**, then on the host:
 
 ```powershell
 # Basic session (no internet in VM -- full isolation)
-.\Start-Session.ps1 -ProjectPath C:\Projects\myapp
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp
 
 # With internet (for cargo fetch, npm install, etc.)
-.\Start-Session.ps1 -ProjectPath C:\Projects\myapp -Internet
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp -Internet
 
 # Clean session from snapshot
-.\Start-Session.ps1 -ProjectPath C:\Projects\myapp -Restore -Internet
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp -Restore -Internet
 
 # Auto-extract artifacts when VM shuts down
-.\Start-Session.ps1 -ProjectPath C:\Projects\myapp -Internet -ExtractOnExit
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp -Internet -ExtractOnExit
 ```
 
 Your project is copied to `C:\workspace` inside the VM. Then:
@@ -94,9 +96,9 @@ codex    # OpenAI Codex CLI
 ### Extract artifacts
 
 ```powershell
-.\scripts\Copy-Artifacts.ps1 -DestPath C:\Projects\myapp\artifacts
-.\scripts\Copy-Artifacts.ps1 -WaitForShutdown
-.\scripts\Copy-Artifacts.ps1 -ExtraPatterns "*.json","*.toml"
+.\scripts\Copy-Artifacts.ps1 -VMName AgentDevSandbox -DestPath C:\Projects\myapp\artifacts
+.\scripts\Copy-Artifacts.ps1 -VMName AgentDevSandbox -WaitForShutdown
+.\scripts\Copy-Artifacts.ps1 -VMName AgentDevSandbox -ExtraPatterns "*.json","*.toml"
 ```
 
 ### Kernel debugging
@@ -114,7 +116,7 @@ The firewall rule defaults to `LocalSubnet` on `Domain,Private` profiles; pass `
 On the Hyper-V host, shut down the debuggee VM and disable Secure Boot so the guest can change BCDEdit debug settings:
 
 ```powershell
-.\scripts\Setup-KernelDebugger.ps1 -DisableVmSecureBoot -SkipFirewall
+.\scripts\Setup-KernelDebugger.ps1 -VMName AgentDevSandbox -DisableVmSecureBoot -SkipFirewall
 ```
 
 Inside the VM/debuggee, run as Administrator with the debugger machine IP and the key printed by `Setup-KernelDebugger.ps1`:
@@ -138,7 +140,7 @@ powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebuggee.ps1 -Disa
 After the debuggee VM shuts down, Secure Boot can be restored on the Hyper-V host:
 
 ```powershell
-.\scripts\Setup-KernelDebugger.ps1 -EnableVmSecureBoot -SkipFirewall
+.\scripts\Setup-KernelDebugger.ps1 -VMName AgentDevSandbox -EnableVmSecureBoot -SkipFirewall
 ```
 
 ### Restore to clean state
@@ -159,6 +161,7 @@ agent-sandbox-vm/
 |
 |-- scripts/
 |   |-- New-AgentVM.ps1        # Creates the Hyper-V VM (Gen 2, TPM, Secure Boot)
+|   |-- AgentSandboxConfig.ps1 # Shared per-VM config/credential resolver
 |   |-- Install-Windows.ps1    # Applies Windows to VHDX via DISM (no DVD boot)
 |   |-- New-UUPDumpISO.ps1     # Optional: builds a Windows ISO from UUP dump
 |   |-- Attach-ISO.ps1         # Alternative: boot from DVD if DISM not needed
@@ -186,6 +189,10 @@ agent-sandbox-vm/
 
 **Artifacts**: `Copy-Artifacts.ps1` pulls build outputs from the VM to your host via PowerShell Direct.
 
+**Multiple VMs**: Host scripts accept `-VMName <name>` to target any VM created by Bootstrap. Without `-VMName`, scripts use the current/default config at `~\.agent-sandbox\config.json`.
+
+**Configuration**: Bootstrap writes a per-VM config at `~\.agent-sandbox\vms\<VMName>\config.json` and also updates `~\.agent-sandbox\config.json` as the current/default VM. Credentials are stored per VM at `~\.agent-sandbox\vms\<VMName>\vm-cred.xml`; the legacy `~\.agent-sandbox\vm-cred.xml` is still read if no per-VM credential exists.
+
 ---
 
 ## Networking
@@ -196,6 +203,10 @@ agent-sandbox-vm/
 | Internet | Default Switch | cargo fetch, npm install, OAuth |
 
 Use `-Internet` flag on `Start-Session.ps1` to enable internet access.
+
+```powershell
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp -Internet
+```
 
 ---
 
@@ -242,6 +253,9 @@ Ensure the VM has finished booting and you've logged in at least once. PSRemotin
 
 **VM has no internet**
 Use `-Internet` flag or manually switch: `Connect-VMNetworkAdapter -VMName AgentDevSandbox -SwitchName "Default Switch"`
+
+**Wrong VM starts**
+Pass `-VMName <name>` explicitly. Commands without `-VMName` use the current/default config from the most recent `Bootstrap.ps1` run.
 
 **Re-authentication when OAuth expires**
 Start the VM with internet, run `claude login` inside it, shut down, take a new snapshot.

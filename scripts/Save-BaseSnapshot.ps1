@@ -4,9 +4,15 @@
 
 #Requires -RunAsAdministrator
 
-$cfg = Get-Content "$env:USERPROFILE\.agent-sandbox\config.json" | ConvertFrom-Json
+param(
+    [string]$VMName = ""
+)
 
-Write-Host "Waiting for VM to be fully shut down..."
+. "$PSScriptRoot\AgentSandboxConfig.ps1"
+
+$cfg = Resolve-AgentSandboxConfig -VMName $VMName -RequireVM
+
+Write-Host "Waiting for VM '$($cfg.VMName)' to be fully shut down..."
 $timeout = 60
 $elapsed = 0
 while ((Get-VM -Name $cfg.VMName).State -ne "Off") {
@@ -33,8 +39,8 @@ Write-Host "Snapshot saved. Your VM is ready."
 Write-Host "Network is set to internal-only (no internet)."
 Write-Host ""
 Write-Host "To allow internet in a session (e.g. for cargo fetch), use:"
-Write-Host "  .\Start-Session.ps1 -ProjectPath <path> -Internet"
+Write-Host "  .\Start-Session.ps1 -VMName '$($cfg.VMName)' -ProjectPath <path> -Internet"
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  1. Save VM credentials:  .\scripts\Save-VMCredentials.ps1"
-Write-Host "  2. Start a dev session:  .\Start-Session.ps1 -ProjectPath C:\Projects\myapp"
+Write-Host "  1. Save VM credentials:  .\scripts\Save-VMCredentials.ps1 -VMName '$($cfg.VMName)'"
+Write-Host "  2. Start a dev session:  .\Start-Session.ps1 -VMName '$($cfg.VMName)' -ProjectPath C:\Projects\myapp"

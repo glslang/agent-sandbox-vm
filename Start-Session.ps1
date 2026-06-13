@@ -8,6 +8,8 @@ param(
     [Parameter(Mandatory)]
     [string]$ProjectPath,
 
+    [string]$VMName = "",
+
     # Where to write artifacts on the host after the session
     [string]$ArtifactDest = "",
 
@@ -29,7 +31,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$cfg = Get-Content "$env:USERPROFILE\.agent-sandbox\config.json" -Raw | ConvertFrom-Json
+. "$PSScriptRoot\scripts\AgentSandboxConfig.ps1"
+
+$cfg = Resolve-AgentSandboxConfig -VMName $VMName -RequireVM
 
 # Default artifact destination: <project>\artifacts
 if (-not $ArtifactDest) {
@@ -38,7 +42,7 @@ if (-not $ArtifactDest) {
 
 # -- Restore snapshot --
 if ($Restore) {
-    Write-Host "Restoring VM to clean snapshot..."
+    Write-Host "Restoring VM '$($cfg.VMName)' to clean snapshot..."
     if ((Get-VM -Name $cfg.VMName -ErrorAction SilentlyContinue).State -ne "Off") {
         Stop-VM -Name $cfg.VMName -Force
     }
@@ -49,7 +53,7 @@ if ($Restore) {
 
 # -- Network switch --
 if ($Internet) {
-    Write-Host "Switching VM to Default Switch (internet access)..."
+    Write-Host "Switching VM '$($cfg.VMName)' to Default Switch (internet access)..."
     Connect-VMNetworkAdapter -VMName $cfg.VMName -SwitchName "Default Switch"
 } else {
     # Ensure internal switch (no internet -- full isolation)
@@ -80,12 +84,7 @@ if ($vmState -eq "Off") {
 
 # -- Copy project into VM via PowerShell Direct --
 Write-Host "Copying project into VM..."
-$credPath = "$env:USERPROFILE\.agent-sandbox\vm-cred.xml"
-if (Test-Path $credPath) {
-    $cred = Import-Clixml $credPath
-} else {
-    $cred = Get-Credential -Message "VM credentials"
-}
+$cred = Import-AgentSandboxCredential -Config $cfg -PromptIfMissing -PromptMessage "VM credentials for $($cfg.VMName)"
 
 # Wait for VM to be ready for PowerShell Direct
 $ready = $false
@@ -138,11 +137,12 @@ if ($ExtractOnExit) {
 
     Write-Host "VM shut down. Extracting artifacts..."
     & "$PSScriptRoot\scripts\Copy-Artifacts.ps1" `
+        -VMName $cfg.VMName `
         -DestPath $ArtifactDest `
         -VMBuildPath $VMBuildPath `
         -ExtraPatterns $ExtraArtifactPatterns
 } else {
     Write-Host ""
     Write-Host "When done, extract artifacts with:"
-    Write-Host "  .\scripts\Copy-Artifacts.ps1 -DestPath '$ArtifactDest'"
+    Write-Host "  .\scripts\Copy-Artifacts.ps1 -VMName '$($cfg.VMName)' -DestPath '$ArtifactDest'"
 }

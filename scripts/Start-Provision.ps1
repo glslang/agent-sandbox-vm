@@ -7,48 +7,18 @@
 
 #Requires -RunAsAdministrator
 
+param(
+    [string]$VMName = ""
+)
+
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\AgentSandboxConfig.ps1"
 
-function Protect-PathForCurrentUser {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    $item = Get-Item -LiteralPath $Path
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.SetAccessRuleProtection($true, $false)
-
-    foreach ($rule in @($acl.Access)) {
-        $acl.PurgeAccessRules($rule.IdentityReference)
-    }
-
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if ($item.PSIsContainer) {
-        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
-        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
-    } else {
-        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]::None
-        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
-    }
-
-    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $identity,
-        [System.Security.AccessControl.FileSystemRights]::FullControl,
-        $inheritanceFlags,
-        $propagationFlags,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    $acl.AddAccessRule($accessRule)
-    Set-Acl -LiteralPath $Path -AclObject $acl
-}
-
-$configPath = "$env:USERPROFILE\.agent-sandbox\config.json"
-$cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+$cfg = Resolve-AgentSandboxConfig -VMName $VMName -RequireVM
 
 Write-Host ""
 Write-Host "----------------------------------------------"
-Write-Host "  Preparing VM for provisioning"
+Write-Host "  Preparing VM '$($cfg.VMName)' for provisioning"
 Write-Host "----------------------------------------------"
 Write-Host ""
 
@@ -80,19 +50,7 @@ if ($currentSwitch -eq "Default Switch") {
 }
 
 # -- Get VM credentials --
-$credPath = "$env:USERPROFILE\.agent-sandbox\vm-cred.xml"
-if (Test-Path $credPath) {
-    $cred = Import-Clixml $credPath
-    Protect-PathForCurrentUser -Path $credPath
-} else {
-    Write-Host ""
-    Write-Host "  Enter the VM Windows username and password."
-    $cred = Get-Credential -Message "VM credentials"
-    # Save for later
-    $cred | Export-Clixml $credPath
-    Protect-PathForCurrentUser -Path $credPath
-    Write-Host "  Credentials saved for future use."
-}
+$cred = Import-AgentSandboxCredential -Config $cfg -PromptIfMissing -PromptMessage "VM credentials for $($cfg.VMName)"
 
 # -- Copy files into VM --
 Write-Host "[2/3] Copying files into VM via PowerShell Direct..."
@@ -118,6 +76,21 @@ try {
               -Path "$PSScriptRoot\Setup-KernelDebuggee.ps1" `
               -Destination "C:\Setup-KernelDebuggee.ps1"
     Write-Host "  Copied: Setup-KernelDebuggee.ps1"
+
+    $repoRoot = Split-Path -Path $PSScriptRoot -Parent
+    $vmStartAgentPath = Join-Path $repoRoot "vm\Start-Agent.ps1"
+    if (Test-Path $vmStartAgentPath) {
+        Copy-Item -ToSession $session `
+                  -Path $vmStartAgentPath `
+                  -Destination "C:\Start-Agent.ps1"
+        Write-Host "  Copied: Start-Agent.ps1"
+    }
+
+    Invoke-Command -Session $session -ArgumentList $cfg.ShareName -ScriptBlock {
+        param([string]$ShareName)
+        @{ ShareName = $ShareName } | ConvertTo-Json | Set-Content -Path "C:\AgentSandboxVM.json" -Encoding UTF8
+    }
+    Write-Host "  Wrote: AgentSandboxVM.json"
 
     # Copy VS Build Tools offline layout if it exists on host
     $vsLayoutPath = "$($cfg.CacheRoot)\vs-layout\layout"
@@ -156,7 +129,7 @@ Write-Host ""
 Write-Host "    powershell -ExecutionPolicy RemoteSigned -File C:\Invoke-Provision.ps1"
 Write-Host ""
 Write-Host "  After it completes, shut down the VM and run:"
-Write-Host "    .\scripts\Save-BaseSnapshot.ps1"
+Write-Host "    .\scripts\Save-BaseSnapshot.ps1 -VMName '$($cfg.VMName)'"
 Write-Host "----------------------------------------------"
 Write-Host ""
 

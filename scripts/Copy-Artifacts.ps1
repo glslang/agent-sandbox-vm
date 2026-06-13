@@ -4,6 +4,7 @@
 
 param(
     [string]$DestPath   = ".\artifacts",
+    [string]$VMName = "",
     [string]$VMBuildPath = "C:\workspace\target\release",
 
     # Additional glob patterns to copy (beyond .exe/.dll/.pdb)
@@ -13,9 +14,14 @@ param(
     [switch]$WaitForShutdown
 )
 
-$cfg      = Get-Content "$env:USERPROFILE\.agent-sandbox\config.json" | ConvertFrom-Json
-$cred     = Import-Clixml "$env:USERPROFILE\.agent-sandbox\vm-cred.xml"
-$DestPath = Resolve-Path $DestPath -ErrorAction SilentlyContinue ?? $DestPath
+. "$PSScriptRoot\AgentSandboxConfig.ps1"
+
+$cfg = Resolve-AgentSandboxConfig -VMName $VMName -RequireVM
+$cred = Import-AgentSandboxCredential -Config $cfg
+$resolvedDestPath = Resolve-Path $DestPath -ErrorAction SilentlyContinue
+if ($resolvedDestPath) {
+    $DestPath = $resolvedDestPath.Path
+}
 
 # -- Optionally wait for VM shutdown --
 if ($WaitForShutdown) {
@@ -28,7 +34,7 @@ if ($WaitForShutdown) {
 }
 
 # -- Connect and extract --
-Write-Host "Connecting to VM..."
+Write-Host "Connecting to VM '$($cfg.VMName)'..."
 $session = New-PSSession -VMName $cfg.VMName -Credential $cred
 
 try {
