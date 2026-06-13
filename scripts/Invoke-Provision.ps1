@@ -23,9 +23,51 @@ function Refresh-Path {
                 [System.Environment]::GetEnvironmentVariable("PATH", "User")
 }
 
+function Install-WingetPackage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id,
+
+        [string]$DisplayName = $Id
+    )
+
+    winget install `
+        --id $Id `
+        --exact `
+        --source winget `
+        --silent `
+        --accept-package-agreements `
+        --accept-source-agreements
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "winget failed to install $DisplayName ($Id) with exit code $LASTEXITCODE."
+    }
+}
+
+function Assert-CommandAvailable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [string]$InstallHint = ""
+    )
+
+    Refresh-Path
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $command) {
+        $message = "Expected command '$Name' was not found on PATH after installation."
+        if ($InstallHint) {
+            $message += " $InstallHint"
+        }
+        throw $message
+    }
+
+    return $command
+}
+
 # -- 0. Execution Policy --
 # Set machine-wide policy so npm-installed .ps1 wrappers (e.g. claude.ps1) run
-# in all future sessions without needing -ExecutionPolicy Bypass each time.
+# in all future sessions without needing a per-process policy override each time.
 Write-Host "[1/13] Setting execution policy..."
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
 Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
@@ -74,14 +116,15 @@ Write-Host "  Rust installed: $(rustc --version)"
 # -- 3. Node.js --
 Write-Host "[4/13] Installing Node.js..."
 
-winget install --silent --accept-package-agreements --accept-source-agreements OpenJS.NodeJS
-Refresh-Path
+Install-WingetPackage -Id "OpenJS.NodeJS" -DisplayName "Node.js"
+Assert-CommandAvailable -Name "node" -InstallHint "If Node was installed by winget, open a new elevated PowerShell session or verify C:\Program Files\nodejs is on PATH." | Out-Null
+Assert-CommandAvailable -Name "npm" -InstallHint "npm should be installed with Node.js." | Out-Null
 Write-Host "  Node installed: $(node --version)"
 
 # -- 4. Git for Windows (Git Bash) --
 Write-Host "[5/13] Installing Git for Windows..."
 
-winget install --silent --accept-package-agreements --accept-source-agreements Git.Git
+Install-WingetPackage -Id "Git.Git" -DisplayName "Git for Windows"
 Refresh-Path
 
 # Locate bash.exe and pin it via CLAUDE_CODE_GIT_BASH_PATH so Claude Code can
@@ -104,21 +147,21 @@ if ($gitBashExe) {
 # -- 5b. GitHub CLI --
 Write-Host "[6/13] Installing GitHub CLI..."
 
-winget install --silent --accept-package-agreements --accept-source-agreements GitHub.cli
-Refresh-Path
+Install-WingetPackage -Id "GitHub.cli" -DisplayName "GitHub CLI"
+Assert-CommandAvailable -Name "gh" -InstallHint "GitHub CLI should be installed by winget." | Out-Null
 Write-Host "  GitHub CLI installed: $(gh --version | Select-Object -First 1)"
 
 # -- 6. Windows Terminal --
 Write-Host "[7/13] Installing Windows Terminal..."
 
-winget install --silent --accept-package-agreements --accept-source-agreements Microsoft.WindowsTerminal
+Install-WingetPackage -Id "Microsoft.WindowsTerminal" -DisplayName "Windows Terminal"
 Write-Host "  Windows Terminal installed."
 
 # -- 7. Oh My Posh --
 Write-Host "[8/13] Installing Oh My Posh..."
 
-winget install --silent --accept-package-agreements --accept-source-agreements "JanDe Jong.OhMyPosh"
-Refresh-Path
+Install-WingetPackage -Id "JanDeDobbeleer.OhMyPosh" -DisplayName "Oh My Posh"
+Assert-CommandAvailable -Name "oh-my-posh" -InstallHint "Oh My Posh should be installed by winget." | Out-Null
 
 # CascadiaCode Nerd Font is required for glyph rendering in most themes.
 oh-my-posh font install CascadiaCode --user
@@ -135,9 +178,8 @@ Write-Host "  Themes directory: `$env:POSH_THEMES_PATH -- swap theme by editing 
 # -- 8. TTD command line utility --
 Write-Host "[9/13] Installing TTD command line utility..."
 
-winget install --silent --accept-package-agreements --accept-source-agreements --id Microsoft.TimeTravelDebugging --exact
-Refresh-Path
-$ttdCommand = Get-Command ttd.exe -ErrorAction Stop
+Install-WingetPackage -Id "Microsoft.TimeTravelDebugging" -DisplayName "TTD command line utility"
+$ttdCommand = Assert-CommandAvailable -Name "ttd.exe" -InstallHint "TTD should be installed by winget."
 Write-Host "  TTD installed: $($ttdCommand.Source)"
 
 # -- 9. Claude Code --
