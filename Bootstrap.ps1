@@ -67,6 +67,10 @@ Protect-AgentSandboxPath -Path $aclTarget
 Write-Host "  Locked down: $aclTarget"
 
 # Write per-VM config and update the current/default config for compatibility.
+$migratedConfigPath = Save-AgentSandboxLegacyConfigSnapshot -SkipVMName $config.VMName
+if ($migratedConfigPath) {
+    Write-Host "  Migrated previous VM config to: $migratedConfigPath"
+}
 $savedConfigPath = Save-AgentSandboxConfig -Config $config -SetCurrent
 Write-Host "  VM config saved to: $savedConfigPath"
 Write-Host "  Current config saved to: $(Get-AgentSandboxLegacyConfigPath)"
@@ -131,6 +135,7 @@ if (Get-VM -Name $config.VMName -ErrorAction SilentlyContinue) {
     & "$PSScriptRoot\scripts\New-AgentVM.ps1" -VMName $config.VMName
     Write-Host "  VM created: $($config.VMName)"
 }
+Ensure-AgentSandboxShare -Config ([pscustomobject]$config)
 
 # -- Step 5: Install Windows directly to VHDX --
 Write-Host ""

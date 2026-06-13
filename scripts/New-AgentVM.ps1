@@ -71,16 +71,7 @@ Write-Host "  DVD controller: $((Get-VMDvdDrive -VMName $cfg.VMName).ControllerN
 Enable-VMIntegrationService -VMName $cfg.VMName -Name "Guest Service Interface"
 
 # SMB share (handy for file drops before PSRemoting is up)
-$shareName = $cfg.ShareName
-$existingShare = Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue
-if (-not $existingShare) {
-    New-SmbShare -Name $shareName `
-                 -Path $cfg.SharedDrive `
-                 -FullAccess "$env:USERDOMAIN\$env:USERNAME" | Out-Null
-    Write-Host "  SMB share created: \\localhost\$shareName -> $($cfg.SharedDrive)"
-} elseif ($existingShare.Path -ne $cfg.SharedDrive) {
-    throw "SMB share '$shareName' already points to '$($existingShare.Path)', not '$($cfg.SharedDrive)'."
-}
+Ensure-AgentSandboxShare -Config $cfg
 
 Write-Host "  VM '$($cfg.VMName)' created successfully."
 Write-Host "  Secure Boot: On (MicrosoftWindows template)"

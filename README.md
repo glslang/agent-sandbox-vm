@@ -191,7 +191,7 @@ agent-sandbox-vm/
 
 **Multiple VMs**: Host scripts accept `-VMName <name>` to target any VM created by Bootstrap. Without `-VMName`, scripts use the current/default config at `~\.agent-sandbox\config.json`.
 
-**Configuration**: Bootstrap writes a per-VM config at `~\.agent-sandbox\vms\<VMName>\config.json` and also updates `~\.agent-sandbox\config.json` as the current/default VM. Credentials are stored per VM at `~\.agent-sandbox\vms\<VMName>\vm-cred.xml`; the legacy `~\.agent-sandbox\vm-cred.xml` is still read if no per-VM credential exists.
+**Configuration**: Bootstrap writes a per-VM config at `~\.agent-sandbox\vms\<VMName>\config.json` and also updates `~\.agent-sandbox\config.json` as the current/default VM. Credentials are stored per VM at `~\.agent-sandbox\vms\<VMName>\vm-cred.xml`; legacy root credentials remain valid only for migrated legacy-layout configs.
 
 ---
 
