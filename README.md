@@ -2,6 +2,8 @@
 
 A fully scripted Hyper-V sandbox for running agent tools on Windows with native MSVC toolchain support. The agent runs inside an isolated VM, builds real Windows binaries, and artifacts are automatically extracted back to your host.
 
+> macOS host note: this repository also includes an experimental Apple Silicon `Virtualization.framework` implementation under [`macos/`](macos/README.md). It supports macOS guests from Apple IPSW restore images and has an experimental generic EFI path for Windows ARM64 media. It is not feature-equivalent to the Hyper-V workflow because Apple does not expose Windows IPSW install, PowerShell Direct, Hyper-V checkpoints, or Windows vTPM parity through `Virtualization.framework`.
+
 ## Requirements
 
 - Windows 10/11 **Pro or Enterprise** (Hyper-V required)
