@@ -4,40 +4,7 @@
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = "Stop"
-
-function Protect-PathForCurrentUser {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    $item = Get-Item -LiteralPath $Path
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.SetAccessRuleProtection($true, $false)
-
-    foreach ($rule in @($acl.Access)) {
-        $acl.PurgeAccessRules($rule.IdentityReference)
-    }
-
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if ($item.PSIsContainer) {
-        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
-        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
-    } else {
-        $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]::None
-        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
-    }
-
-    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $identity,
-        [System.Security.AccessControl.FileSystemRights]::FullControl,
-        $inheritanceFlags,
-        $propagationFlags,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    $acl.AddAccessRule($accessRule)
-    Set-Acl -LiteralPath $Path -AclObject $acl
-}
+. "$PSScriptRoot\scripts\AgentSandboxConfig.ps1"
 
 Write-Host ""
 Write-Host "----------------------------------------------"
@@ -54,12 +21,15 @@ if ($vmName -match '[<>:"/\\|?*]') {
     throw "VM name cannot contain any of these characters: < > : `" / \ | ? *"
 }
 
+$vmStatePath = Get-AgentSandboxVMStatePath -VMName $vmName
+
 $config = @{
     VMName        = $vmName
     VMPath        = "D:\Hyper-V\$vmName"
-    SharedDrive   = "D:\Hyper-V\Shared"
+    SharedDrive   = "D:\Hyper-V\$vmName\Shared"
+    ShareName     = Get-AgentSandboxShareName -VMName $vmName
     CacheRoot     = "D:\AgentSandboxCache"
-    CredPath      = "$env:USERPROFILE\.agent-sandbox"
+    CredPath      = $vmStatePath
     ProjectsRoot  = "D:\workspace"
 }
 
@@ -93,12 +63,13 @@ foreach ($f in $folders) {
 
 # Lock down credentials folder
 $aclTarget = $config.CredPath
-Protect-PathForCurrentUser -Path $aclTarget
+Protect-AgentSandboxPath -Path $aclTarget
 Write-Host "  Locked down: $aclTarget"
 
-# Write config file for other scripts to read
-$config | ConvertTo-Json | Out-File "$($config.CredPath)\config.json" -Encoding utf8
-Write-Host "  Config saved to: $($config.CredPath)\config.json"
+# Write per-VM config and update the current/default config for compatibility.
+$savedConfigPath = Save-AgentSandboxConfig -Config $config -SetCurrent
+Write-Host "  VM config saved to: $savedConfigPath"
+Write-Host "  Current config saved to: $(Get-AgentSandboxLegacyConfigPath)"
 
 # -- Step 3: Download VS Build Tools offline layout --
 Write-Host "[3/6] Downloading VS Build Tools offline layout (~3-4 GB)..."
@@ -157,7 +128,7 @@ Write-Host "[4/6] Creating Hyper-V VM..."
 if (Get-VM -Name $config.VMName -ErrorAction SilentlyContinue) {
     Write-Host "  VM '$($config.VMName)' already exists, skipping creation."
 } else {
-    & "$PSScriptRoot\scripts\New-AgentVM.ps1"
+    & "$PSScriptRoot\scripts\New-AgentVM.ps1" -VMName $config.VMName
     Write-Host "  VM created: $($config.VMName)"
 }
 
@@ -203,12 +174,13 @@ if ($null -ne $uupArgs) {
 if ([string]::IsNullOrWhiteSpace($isoPath) -or -not (Test-Path $isoPath)) {
     Write-Host "  ERROR: ISO not found at '$isoPath'."
     Write-Host "  Run manually once you have the ISO:"
-    Write-Host "    .\scripts\Install-Windows.ps1 -ISOPath <path>"
+    Write-Host "    .\scripts\Install-Windows.ps1 -VMName '$($config.VMName)' -ISOPath <path>"
 } else {
     $installArgs = @{ ISOPath = $isoPath }
     if ($unattendPath -and (Test-Path $unattendPath)) {
         $installArgs.UnattendPath = $unattendPath
     }
+    $installArgs.VMName = $config.VMName
     & "$PSScriptRoot\scripts\Install-Windows.ps1" @installArgs
 }
 
@@ -220,11 +192,11 @@ Write-Host "  1. Complete Windows setup in the VM console (OOBE)."
 Write-Host "     (Skipped automatically if you provided autounattend.xml)"
 Write-Host ""
 Write-Host "  2. Provision the VM (switches network, copies files, installs tools):"
-Write-Host "     .\scripts\Start-Provision.ps1"
+Write-Host "     .\scripts\Start-Provision.ps1 -VMName '$($config.VMName)'"
 Write-Host ""
 Write-Host "  3. After provisioning, shut down the VM and run on the host:"
-Write-Host "     .\scripts\Save-BaseSnapshot.ps1"
+Write-Host "     .\scripts\Save-BaseSnapshot.ps1 -VMName '$($config.VMName)'"
 Write-Host ""
 Write-Host "  4. Start your first dev session:"
-Write-Host "     .\Start-Session.ps1 -ProjectPath C:\Projects\myapp"
+Write-Host "     .\Start-Session.ps1 -VMName '$($config.VMName)' -ProjectPath C:\Projects\myapp"
 Write-Host ""

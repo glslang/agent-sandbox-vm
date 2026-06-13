@@ -12,11 +12,14 @@
 
 param(
     [Parameter(Mandatory)]
-    [string]$ISOPath
+    [string]$ISOPath,
+
+    [string]$VMName = ""
 )
 
-$configPath = "$env:USERPROFILE\.agent-sandbox\config.json"
-$cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+. "$PSScriptRoot\AgentSandboxConfig.ps1"
+
+$cfg = Resolve-AgentSandboxConfig -VMName $VMName -RequireVM
 
 if (-not (Test-Path $ISOPath)) {
     Write-Error "ISO not found at: $ISOPath"

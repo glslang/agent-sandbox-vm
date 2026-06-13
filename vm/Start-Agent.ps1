@@ -4,9 +4,22 @@
 # Path inside VM: C:\Users\<user>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\
 
 $workspacePath = "C:\workspace"
+$shareName = "AgentSandboxShare"
+$agentSandboxConfigPath = "C:\AgentSandboxVM.json"
+
+if (Test-Path $agentSandboxConfigPath) {
+    try {
+        $agentSandboxConfig = Get-Content $agentSandboxConfigPath -Raw | ConvertFrom-Json
+        if ($agentSandboxConfig.ShareName) {
+            $shareName = $agentSandboxConfig.ShareName
+        }
+    } catch {
+        Write-Warning "Could not read $agentSandboxConfigPath; using legacy share name."
+    }
+}
 
 # Sync shared project files into workspace on boot
-$sharedProject = "\\localhost\AgentSandboxShare\project"
+$sharedProject = "\\localhost\$shareName\project"
 if (Test-Path $sharedProject) {
     Write-Host "Syncing project from host share..."
     robocopy $sharedProject $workspacePath /MIR /NFL /NDL /NJH | Out-Null

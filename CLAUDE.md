@@ -22,28 +22,28 @@ A PowerShell-based infrastructure toolkit that creates an isolated Hyper-V sandb
 .\scripts\New-UUPDumpISO.ps1 -Version "Windows 11, version 25H2" -Architecture arm64
 
 # Step 2: Provision toolchain (run on host — switches network, copies files into VM)
-.\scripts\Start-Provision.ps1
+.\scripts\Start-Provision.ps1 -VMName AgentDevSandbox
 # Then inside the VM:
 powershell -ExecutionPolicy RemoteSigned -File C:\Invoke-Provision.ps1
 
 # Step 3: Save the clean snapshot (shut down VM first)
-.\scripts\Save-BaseSnapshot.ps1
+.\scripts\Save-BaseSnapshot.ps1 -VMName AgentDevSandbox
 ```
 
 ### Daily Development
 
 ```powershell
 # Basic session (VM fully isolated, no internet)
-.\Start-Session.ps1 -ProjectPath C:\Projects\myapp
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp
 
 # With internet (needed for cargo fetch, npm install, etc.)
-.\Start-Session.ps1 -ProjectPath C:\Projects\myapp -Internet
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp -Internet
 
 # Restore to clean snapshot before starting (reproducible build)
-.\Start-Session.ps1 -ProjectPath C:\Projects\myapp -Restore -Internet
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp -Restore -Internet
 
 # Auto-extract artifacts when VM shuts down
-.\Start-Session.ps1 -ProjectPath C:\Projects\myapp -Internet -ExtractOnExit
+.\Start-Session.ps1 -VMName AgentDevSandbox -ProjectPath C:\Projects\myapp -Internet -ExtractOnExit
 ```
 
 Inside the VM after session starts:
@@ -56,13 +56,13 @@ claude
 
 ```powershell
 # Extract .exe/.dll/.pdb from C:\workspace\target\release
-.\scripts\Copy-Artifacts.ps1 -DestPath C:\Projects\myapp\artifacts
+.\scripts\Copy-Artifacts.ps1 -VMName AgentDevSandbox -DestPath C:\Projects\myapp\artifacts
 
 # Wait for VM shutdown then extract
-.\scripts\Copy-Artifacts.ps1 -WaitForShutdown
+.\scripts\Copy-Artifacts.ps1 -VMName AgentDevSandbox -WaitForShutdown
 
 # Include additional file types
-.\scripts\Copy-Artifacts.ps1 -ExtraPatterns "*.json","*.toml"
+.\scripts\Copy-Artifacts.ps1 -VMName AgentDevSandbox -ExtraPatterns "*.json","*.toml"
 ```
 
 ### VM Management
@@ -86,11 +86,12 @@ claude login
 | `Bootstrap.ps1` | Host | One-time setup orchestrator |
 | `scripts/New-AgentVM.ps1` | Host | Creates Gen 2 VM (TPM, Secure Boot, SCSI layout) |
 | `scripts/Install-Windows.ps1` | Host | Applies Windows to VHDX via DISM (bypasses DVD boot) |
+| `scripts/AgentSandboxConfig.ps1` | Host | Resolves per-VM config and credentials |
 | `scripts/New-UUPDumpISO.ps1` | Host | Optional: builds a Windows ISO from UUP dump (defaults to Windows Server 2025 amd64; `-Version`/`-Architecture`/`-Edition` selectable) |
 | `scripts/Start-Provision.ps1` | Host | Switches to Default Switch, copies VS layout + provisioner into VM |
 | `scripts/Invoke-Provision.ps1` | **VM** | Installs VS Build Tools, Rust (MSVC), Node.js, Claude Code, enables PSRemoting |
 | `scripts/Save-BaseSnapshot.ps1` | Host | Captures `CleanProvisionedBase` checkpoint |
-| `scripts/Save-VMCredentials.ps1` | Host | Encrypts VM creds to `~/.agent-sandbox/vm-cred.xml` |
+| `scripts/Save-VMCredentials.ps1` | Host | Encrypts VM creds to `~/.agent-sandbox/vms/<VMName>/vm-cred.xml` |
 | `Start-Session.ps1` | Host | Daily driver: restore/switch network/sync project/open console |
 | `scripts/Copy-Artifacts.ps1` | Host | Pulls build outputs from VM via PowerShell Direct |
 | `scripts/Open-VMConsole.ps1` | Host | Launches `vmconnect.exe`, pre-writing the saved-config XML to skip Hyper-V's display dialog |
@@ -101,7 +102,7 @@ claude login
 All host↔VM file transfer uses **PowerShell Direct** (VMBus), which works without any network configuration:
 - Project sync into VM: `Copy-Item -ToSession` (excludes `artifacts/`, `.git/`, `target/`)
 - Artifact extraction: `Copy-Item -FromSession`
-- Pre-boot fallback: robocopy to SMB share at `\\localhost\AgentSandboxShare`
+- Pre-boot fallback: robocopy to the VM's configured SMB share
 
 ### Networking
 
@@ -111,18 +112,19 @@ Two modes, switched via `Connect-VMNetworkAdapter`:
 
 ### Configuration
 
-All scripts read `~/.agent-sandbox/config.json` (written by Bootstrap.ps1):
+Bootstrap writes per-VM config to `~/.agent-sandbox/vms/<VMName>/config.json` and also updates `~/.agent-sandbox/config.json` as the current/default VM for commands that omit `-VMName`:
 ```json
 {
   "VMName": "AgentDevSandbox",
   "VMPath": "D:\\Hyper-V\\AgentDevSandbox",
-  "SharedDrive": "D:\\Hyper-V\\Shared",
+  "SharedDrive": "D:\\Hyper-V\\AgentDevSandbox\\Shared",
+  "ShareName": "AgentSandboxShare-AgentDevSandbox",
   "CacheRoot": "D:\\AgentSandboxCache",
-  "CredPath": "%USERPROFILE%\\.agent-sandbox",
+  "CredPath": "%USERPROFILE%\\.agent-sandbox\\vms\\AgentDevSandbox",
   "ProjectsRoot": "D:\\workspace"
 }
 ```
-Credentials are stored as an encrypted `vm-cred.xml` (only readable by the host Windows user who created it).
+Credentials are stored per VM as encrypted `vm-cred.xml` files (only readable by the host Windows user who created them). Legacy `~/.agent-sandbox/vm-cred.xml` is still read as a fallback.
 
 ### VM Spec (set in `New-AgentVM.ps1`)
 
