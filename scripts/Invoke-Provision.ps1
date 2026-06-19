@@ -68,12 +68,22 @@ function Assert-CommandAvailable {
 # -- 0. Execution Policy --
 # Set machine-wide policy so npm-installed .ps1 wrappers (e.g. claude.ps1) run
 # in all future sessions without needing a per-process policy override each time.
-Write-Host "[1/13] Setting execution policy..."
+Write-Host "[1/14] Setting execution policy..."
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
 Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 
-# -- 1. VS Build Tools --
-Write-Host "[2/13] Installing VS Build Tools..."
+# -- 1. PowerShell 7 --
+# Install the modern cross-platform PowerShell (pwsh). Windows ships only with
+# Windows PowerShell 5.1; pwsh is the preferred shell for agent tooling and is
+# the host targeted by the Oh My Posh profile init configured below.
+Write-Host "[2/14] Installing PowerShell 7..."
+
+Install-WingetPackage -Id "Microsoft.PowerShell" -DisplayName "PowerShell 7"
+$pwshCommand = Assert-CommandAvailable -Name "pwsh.exe" -InstallHint "PowerShell 7 should be installed by winget; verify C:\Program Files\PowerShell\7 is on PATH."
+Write-Host "  PowerShell 7 installed: $(pwsh --version)"
+
+# -- 2. VS Build Tools --
+Write-Host "[3/14] Installing VS Build Tools..."
 
 $layoutInstaller = "C:\vs-cache\layout\vs_buildtools.exe"
 $onlineInstaller = "$env:TEMP\vs_buildtools.exe"
@@ -104,8 +114,8 @@ if ($proc.ExitCode -notin 0, 3010) {
     Write-Host "  VS Build Tools installed."
 }
 
-# -- 2. Rust (MSVC toolchain) --
-Write-Host "[3/13] Installing Rust..."
+# -- 3. Rust (MSVC toolchain) --
+Write-Host "[4/14] Installing Rust..."
 
 Invoke-WebRequest "https://win.rustup.rs/x86_64" -OutFile "$env:TEMP\rustup-init.exe"
 & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
@@ -113,16 +123,16 @@ Refresh-Path
 rustup component add clippy rustfmt
 Write-Host "  Rust installed: $(rustc --version)"
 
-# -- 3. Node.js --
-Write-Host "[4/13] Installing Node.js..."
+# -- 4. Node.js --
+Write-Host "[5/14] Installing Node.js..."
 
 Install-WingetPackage -Id "OpenJS.NodeJS" -DisplayName "Node.js"
 Assert-CommandAvailable -Name "node" -InstallHint "If Node was installed by winget, open a new elevated PowerShell session or verify C:\Program Files\nodejs is on PATH." | Out-Null
 Assert-CommandAvailable -Name "npm" -InstallHint "npm should be installed with Node.js." | Out-Null
 Write-Host "  Node installed: $(node --version)"
 
-# -- 4. Git for Windows (Git Bash) --
-Write-Host "[5/13] Installing Git for Windows..."
+# -- 5. Git for Windows (Git Bash) --
+Write-Host "[6/14] Installing Git for Windows..."
 
 Install-WingetPackage -Id "Git.Git" -DisplayName "Git for Windows"
 Refresh-Path
@@ -144,21 +154,21 @@ if ($gitBashExe) {
     Write-Warning "  bash.exe not found in expected locations -- set CLAUDE_CODE_GIT_BASH_PATH manually."
 }
 
-# -- 5b. GitHub CLI --
-Write-Host "[6/13] Installing GitHub CLI..."
+# -- 6. GitHub CLI --
+Write-Host "[7/14] Installing GitHub CLI..."
 
 Install-WingetPackage -Id "GitHub.cli" -DisplayName "GitHub CLI"
 Assert-CommandAvailable -Name "gh" -InstallHint "GitHub CLI should be installed by winget." | Out-Null
 Write-Host "  GitHub CLI installed: $(gh --version | Select-Object -First 1)"
 
-# -- 6. Windows Terminal --
-Write-Host "[7/13] Installing Windows Terminal..."
+# -- 7. Windows Terminal --
+Write-Host "[8/14] Installing Windows Terminal..."
 
 Install-WingetPackage -Id "Microsoft.WindowsTerminal" -DisplayName "Windows Terminal"
 Write-Host "  Windows Terminal installed."
 
-# -- 7. Oh My Posh --
-Write-Host "[8/13] Installing Oh My Posh..."
+# -- 8. Oh My Posh --
+Write-Host "[9/14] Installing Oh My Posh..."
 
 Install-WingetPackage -Id "JanDeDobbeleer.OhMyPosh" -DisplayName "Oh My Posh"
 Assert-CommandAvailable -Name "oh-my-posh" -InstallHint "Oh My Posh should be installed by winget." | Out-Null
@@ -167,37 +177,51 @@ Assert-CommandAvailable -Name "oh-my-posh" -InstallHint "Oh My Posh should be in
 oh-my-posh font install CascadiaCode --user
 
 # Add Oh My Posh init to the PowerShell profile using the jandedobbeleer theme.
-# The profile file may not exist yet; ensure its directory does.
-$profileDir = Split-Path $PROFILE -Parent
-if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }
-if (-not (Test-Path $PROFILE))    { New-Item -ItemType File    -Force -Path $PROFILE    | Out-Null }
-Add-Content -Path $PROFILE -Value 'oh-my-posh init pwsh --config "$env:POSH_THEMES_PATH\jandedobbeleer.omp.json" | Invoke-Expression'
-Write-Host "  Oh My Posh installed (theme: jandedobbeleer, font: CascadiaCode NF)."
-Write-Host "  Themes directory: `$env:POSH_THEMES_PATH -- swap theme by editing `$PROFILE."
+# Configure both the Windows PowerShell 5.1 profile (this script's host) and the
+# PowerShell 7 (pwsh) profile, since they live in separate locations.
+$ompInit = 'oh-my-posh init pwsh --config "$env:POSH_THEMES_PATH\jandedobbeleer.omp.json" | Invoke-Expression'
 
-# -- 8. TTD command line utility --
-Write-Host "[9/13] Installing TTD command line utility..."
+# Resolve the pwsh profile path; fall back to none if pwsh is unavailable.
+$pwshProfile = (& pwsh -NoProfile -Command '$PROFILE.CurrentUserCurrentHost') 2>$null
+
+$profileTargets = @($PROFILE)
+if ($pwshProfile) { $profileTargets += $pwshProfile }
+
+foreach ($target in $profileTargets) {
+    $profileDir = Split-Path $target -Parent
+    if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }
+    if (-not (Test-Path $target))     { New-Item -ItemType File    -Force -Path $target     | Out-Null }
+    if (-not (Select-String -Path $target -SimpleMatch 'oh-my-posh init pwsh' -Quiet)) {
+        Add-Content -Path $target -Value $ompInit
+    }
+}
+Write-Host "  Oh My Posh installed (theme: jandedobbeleer, font: CascadiaCode NF)."
+Write-Host "  Configured profiles: $($profileTargets -join ', ')"
+Write-Host "  Themes directory: `$env:POSH_THEMES_PATH -- swap theme by editing your profile."
+
+# -- 9. TTD command line utility --
+Write-Host "[10/14] Installing TTD command line utility..."
 
 Install-WingetPackage -Id "Microsoft.TimeTravelDebugging" -DisplayName "TTD command line utility"
 $ttdCommand = Assert-CommandAvailable -Name "ttd.exe" -InstallHint "TTD should be installed by winget."
 Write-Host "  TTD installed: $($ttdCommand.Source)"
 
-# -- 9. Claude Code --
-Write-Host "[10/13] Installing Claude Code..."
+# -- 10. Claude Code --
+Write-Host "[11/14] Installing Claude Code..."
 
 npm install -g @anthropic-ai/claude-code
 Refresh-Path
 Write-Host "  Claude Code installed: $(claude --version)"
 
-# -- 10. OpenAI Codex CLI --
-Write-Host "[11/13] Installing OpenAI Codex CLI..."
+# -- 11. OpenAI Codex CLI --
+Write-Host "[12/14] Installing OpenAI Codex CLI..."
 
 npm install -g @openai/codex
 Refresh-Path
 Write-Host "  Codex CLI installed: $(codex --version)"
 
-# -- 11. Authenticate --
-Write-Host "[12/13] Authenticating with Claude (optional)..."
+# -- 12. Authenticate --
+Write-Host "[13/14] Authenticating with Claude (optional)..."
 Write-Host "  Skip this step if you are using OpenAI Codex CLI only."
 Write-Host ""
 $reply = Read-Host "  Authenticate with Claude now? [Y/n]"
@@ -209,8 +233,8 @@ if ($reply -eq '' -or $reply -match '^[Yy]') {
     Write-Host "  Skipped. Run 'claude login' inside the VM whenever you need it."
 }
 
-# -- 12. Enable PSRemoting (for artifact extraction from host) --
-Write-Host "[13/13] Enabling PowerShell remoting..."
+# -- 13. Enable PSRemoting (for artifact extraction from host) --
+Write-Host "[14/14] Enabling PowerShell remoting..."
 
 Enable-PSRemoting -Force -SkipNetworkProfileCheck
 Set-Service WinRM -StartupType Automatic
