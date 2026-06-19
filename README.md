@@ -1,5 +1,12 @@
 # Agent Sandbox VM
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)](#requirements)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE.svg?logo=powershell&logoColor=white)](https://learn.microsoft.com/powershell/)
+[![Hyper-V](https://img.shields.io/badge/Hyper--V-Gen%202%20VM-0078D6.svg?logo=windows&logoColor=white)](https://learn.microsoft.com/virtualization/hyper-v-on-windows/)
+[![Swift](https://img.shields.io/badge/Swift-Virtualization.framework-F05138.svg?logo=swift&logoColor=white)](macos/README.md)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-ready-D97757.svg?logo=anthropic&logoColor=white)](https://claude.ai/code)
+
 A fully scripted Hyper-V sandbox for running agent tools on Windows with native MSVC toolchain support. The agent runs inside an isolated VM, builds real Windows binaries, and artifacts are automatically extracted back to your host.
 
 > macOS host note: this repository also includes an experimental Apple Silicon `Virtualization.framework` implementation under [`macos/`](macos/README.md). It supports macOS guests from Apple IPSW restore images and has an experimental generic EFI path for Windows ARM64 media. It is not feature-equivalent to the Hyper-V workflow because Apple does not expose Windows IPSW install, PowerShell Direct, Hyper-V checkpoints, or Windows vTPM parity through `Virtualization.framework`.
