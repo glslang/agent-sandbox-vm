@@ -23,6 +23,44 @@ function Refresh-Path {
                 [System.Environment]::GetEnvironmentVariable("PATH", "User")
 }
 
+function Assert-WinGetAvailable {
+    # On a freshly provisioned VM this runs shortly after the user's first login,
+    # and WinGet (Microsoft.DesktopAppInstaller) registration is asynchronous --
+    # the `winget` command can be missing for a short window after OOBE. Wait for
+    # it, re-registering the AppX package if it does not appear on its own.
+    # See https://learn.microsoft.com/en-us/windows/package-manager/winget/#install-winget
+    param(
+        [int]$MaxAttempts = 10,
+        [int]$DelaySeconds = 6
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Refresh-Path
+        if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+            Write-Host "  winget is available."
+            return
+        }
+
+        Write-Host "  winget not available yet (attempt $attempt/$MaxAttempts); attempting to register..."
+        try {
+            Add-AppxPackage -RegisterByFamilyName -MainPackage "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe" -ErrorAction Stop
+        } catch {
+            Write-Host "  Registration attempt failed: $($_.Exception.Message)"
+        }
+
+        Refresh-Path
+        if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+            Write-Host "  winget is available."
+            return
+        }
+
+        Start-Sleep -Seconds $DelaySeconds
+    }
+
+    throw "winget (Microsoft.DesktopAppInstaller) did not become available after $MaxAttempts attempts. " +
+          "On a fresh VM, WinGet may still be registering after first login -- wait a moment and re-run this script."
+}
+
 function Install-WingetPackage {
     param(
         [Parameter(Mandatory = $true)]
@@ -78,6 +116,9 @@ Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 # the host targeted by the Oh My Posh profile init configured below.
 Write-Host "[2/14] Installing PowerShell 7..."
 
+# This is the first winget call on the provisioning path, so make sure WinGet has
+# finished registering before relying on it.
+Assert-WinGetAvailable
 Install-WingetPackage -Id "Microsoft.PowerShell" -DisplayName "PowerShell 7"
 $pwshCommand = Assert-CommandAvailable -Name "pwsh.exe" -InstallHint "PowerShell 7 should be installed by winget; verify C:\Program Files\PowerShell\7 is on PATH."
 Write-Host "  PowerShell 7 installed: $(pwsh --version)"
