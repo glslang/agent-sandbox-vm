@@ -137,6 +137,7 @@ Credentials are stored per VM as encrypted `vm-cred.xml` files (only readable by
 
 ### Toolchain Inside VM (installed by `Invoke-Provision.ps1`)
 
+- PowerShell 7 (`pwsh` via winget `Microsoft.PowerShell`)
 - VS Build Tools 2026 with `VCTools` workload + Windows 11 SDK 26100 + CMake
 - Rust stable (`x86_64-pc-windows-msvc`) with clippy and rustfmt
 - Node.js (latest via winget)
