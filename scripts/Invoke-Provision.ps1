@@ -57,6 +57,13 @@ function Assert-WinGetAvailable {
         Start-Sleep -Seconds $DelaySeconds
     }
 
+    # Final check: winget may have finished registering during the last sleep.
+    Refresh-Path
+    if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+        Write-Host "  winget is available."
+        return
+    }
+
     throw "winget (Microsoft.DesktopAppInstaller) did not become available after $MaxAttempts attempts. " +
           "On a fresh VM, WinGet may still be registering after first login -- wait a moment and re-run this script."
 }
