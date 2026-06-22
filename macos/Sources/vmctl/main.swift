@@ -244,29 +244,37 @@ extension VMCTL {
         }
 
         try FileManager.default.createDirectory(at: paths.bundleURL, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: paths.sharedURL, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: paths.snapshotsURL, withIntermediateDirectories: true)
-        try createRawDisk(at: paths.diskURL, sizeBytes: UInt64(diskGB) * 1_073_741_824)
+        // Roll back the partially-created bundle if any later step (disk
+        // allocation, restore-image download, metadata) fails, so the command
+        // can simply be re-run instead of tripping the "already exists" guard.
+        do {
+            try FileManager.default.createDirectory(at: paths.sharedURL, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: paths.snapshotsURL, withIntermediateDirectories: true)
+            try createRawDisk(at: paths.diskURL, sizeBytes: UInt64(diskGB) * 1_073_741_824)
 
-        var config = VMConfig(
-            name: name,
-            guest: guest,
-            cpuCount: cpuCount,
-            memorySizeBytes: UInt64(memoryGB) * 1_073_741_824,
-            diskSizeBytes: UInt64(diskGB) * 1_073_741_824,
-            createdAt: ISO8601DateFormatter().string(from: Date()),
-            installed: false,
-            notes: []
-        )
+            var config = VMConfig(
+                name: name,
+                guest: guest,
+                cpuCount: cpuCount,
+                memorySizeBytes: UInt64(memoryGB) * 1_073_741_824,
+                diskSizeBytes: UInt64(diskGB) * 1_073_741_824,
+                createdAt: ISO8601DateFormatter().string(from: Date()),
+                installed: false,
+                notes: []
+            )
 
-        switch guest {
-        case .macos:
-            try createMacMetadata(options: options, paths: paths, config: &config)
-        case .windows:
-            try createWindowsMetadata(options: options, paths: paths, config: &config)
+            switch guest {
+            case .macos:
+                try createMacMetadata(options: options, paths: paths, config: &config)
+            case .windows:
+                try createWindowsMetadata(options: options, paths: paths, config: &config)
+            }
+
+            try saveConfig(config, to: paths.configURL)
+        } catch {
+            try? FileManager.default.removeItem(at: paths.bundleURL)
+            throw error
         }
-
-        try saveConfig(config, to: paths.configURL)
         print("Created \(guest.rawValue) VM bundle: \(paths.bundleURL.path)")
         print("Shared directory: \(paths.sharedURL.path)")
     }
@@ -864,48 +872,80 @@ func fetchLatestRestoreImage(cacheRoot: URL) throws -> URL {
     }
 
     print("Downloading latest supported macOS restore image to \(destination.path)")
+    try downloadFile(from: image.url, to: destination, attempts: 5)
+    return destination
+}
+
+/// Downloads `url` to `destination`, staging through a `.partial` file so an
+/// aborted transfer never leaves a truncated file at the cached destination.
+/// Retries transient network failures, resuming from where it left off whenever
+/// the server hands back resume data (these restore images are ~16 GB, so a mid
+/// transfer drop should not force the whole download to start over).
+func downloadFile(from url: URL, to destination: URL, attempts: Int) throws {
     let partial = destination.appendingPathExtension("partial")
     if FileManager.default.fileExists(atPath: partial.path) {
         try FileManager.default.removeItem(at: partial)
     }
 
-    let downloadSemaphore = DispatchSemaphore(value: 0)
     final class DownloadBox: @unchecked Sendable {
         var location: URL?
         var error: Error?
     }
-    let downloadBox = DownloadBox()
-    let task = URLSession.shared.downloadTask(with: image.url) { location, _, error in
-        downloadBox.location = location
-        downloadBox.error = error
-        downloadSemaphore.signal()
-    }
 
-    let progressQueue = DispatchQueue(label: "agent-sandbox.vm.download")
-    let timer = DispatchSource.makeTimerSource(queue: progressQueue)
-    timer.schedule(deadline: .now() + 5, repeating: .seconds(5))
-    var lastPercent = -1
-    timer.setEventHandler {
-        let percent = Int(task.progress.fractionCompleted * 100)
-        if percent != lastPercent {
-            lastPercent = percent
-            print("Download progress: \(percent)%")
+    var resumeData: Data?
+    var lastError: Error?
+
+    for attempt in 1...attempts {
+        let downloadSemaphore = DispatchSemaphore(value: 0)
+        let downloadBox = DownloadBox()
+        let completion: @Sendable (URL?, URLResponse?, Error?) -> Void = { location, _, error in
+            downloadBox.location = location
+            downloadBox.error = error
+            downloadSemaphore.signal()
         }
-    }
-    timer.resume()
-    task.resume()
-    downloadSemaphore.wait()
-    timer.cancel()
+        let task: URLSessionDownloadTask = resumeData.map {
+            URLSession.shared.downloadTask(withResumeData: $0, completionHandler: completion)
+        } ?? URLSession.shared.downloadTask(with: url, completionHandler: completion)
 
-    if let error = downloadBox.error { throw error }
-    guard let location = downloadBox.location else {
-        throw VMToolError.virtualization("Restore image download did not produce a file")
+        let progressQueue = DispatchQueue(label: "agent-sandbox.vm.download")
+        let timer = DispatchSource.makeTimerSource(queue: progressQueue)
+        timer.schedule(deadline: .now() + 5, repeating: .seconds(5))
+        var lastPercent = -1
+        timer.setEventHandler {
+            let percent = Int(task.progress.fractionCompleted * 100)
+            if percent != lastPercent {
+                lastPercent = percent
+                print("Download progress: \(percent)%")
+            }
+        }
+        timer.resume()
+        task.resume()
+        downloadSemaphore.wait()
+        timer.cancel()
+
+        if let error = downloadBox.error {
+            lastError = error
+            // Keep resume data so the next attempt continues instead of restarting.
+            resumeData = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data
+            if attempt < attempts {
+                let backoff = min(30, attempt * 5)
+                let resuming = resumeData != nil ? " (resuming)" : " (restarting)"
+                FileHandle.standardError.write(Data(
+                    "Download attempt \(attempt)/\(attempts) failed: \(error.localizedDescription). Retrying in \(backoff)s\(resuming)...\n".utf8))
+                Thread.sleep(forTimeInterval: Double(backoff))
+            }
+            continue
+        }
+        guard let location = downloadBox.location else {
+            lastError = VMToolError.virtualization("Restore image download did not produce a file")
+            continue
+        }
+        try FileManager.default.moveItem(at: location, to: partial)
+        try FileManager.default.moveItem(at: partial, to: destination)
+        return
     }
-    // Stage through a .partial path so an aborted download never leaves a
-    // truncated file at the cached destination.
-    try FileManager.default.moveItem(at: location, to: partial)
-    try FileManager.default.moveItem(at: partial, to: destination)
-    return destination
+
+    throw lastError ?? VMToolError.virtualization("Download failed after \(attempts) attempts")
 }
 #endif
 
