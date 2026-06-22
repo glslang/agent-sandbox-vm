@@ -910,12 +910,26 @@ func downloadFile(from url: URL, to destination: URL, attempts: Int) throws {
         let progressQueue = DispatchQueue(label: "agent-sandbox.vm.download")
         let timer = DispatchSource.makeTimerSource(queue: progressQueue)
         timer.schedule(deadline: .now() + 5, repeating: .seconds(5))
-        var lastPercent = -1
+        // Report bytes received directly. task.progress.fractionCompleted often
+        // stays at 0 for these downloads because the CDN does not give the
+        // Progress object a usable total, so percentage alone looks "stuck"
+        // even while ~16 GB streams in fine. countOfBytesReceived always moves.
+        let gib = 1_073_741_824.0
+        var lastReport = ""
         timer.setEventHandler {
-            let percent = Int(task.progress.fractionCompleted * 100)
-            if percent != lastPercent {
-                lastPercent = percent
-                print("Download progress: \(percent)%")
+            let received = task.countOfBytesReceived
+            let expected = task.countOfBytesExpectedToReceive
+            let report: String
+            if expected > 0 {
+                let percent = Int(Double(received) / Double(expected) * 100)
+                report = String(format: "Download progress: %d%% (%.2f / %.2f GB)",
+                                percent, Double(received) / gib, Double(expected) / gib)
+            } else {
+                report = String(format: "Download progress: %.2f GB", Double(received) / gib)
+            }
+            if report != lastReport {
+                lastReport = report
+                print(report)
             }
         }
         timer.resume()
