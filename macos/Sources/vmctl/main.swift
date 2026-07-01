@@ -770,7 +770,11 @@ extension VMCTL {
         try validate(vmConfig)
 
         let queue = DispatchQueue(label: "agent-sandbox.vm.install")
-        let virtualMachine = VZVirtualMachine(configuration: vmConfig, queue: queue)
+        // Bound to `queue` and only ever touched inside the `queue.async` block
+        // below (the calling thread blocks on the semaphore and never accesses
+        // it again), so the cross-thread handoff into the @Sendable closure is
+        // safe despite VZVirtualMachine being non-Sendable.
+        nonisolated(unsafe) let virtualMachine = VZVirtualMachine(configuration: vmConfig, queue: queue)
         let restoreURL = URL(fileURLWithPath: restoreImagePath).standardizedFileURL
         let semaphore = DispatchSemaphore(value: 0)
         final class Box: @unchecked Sendable {
