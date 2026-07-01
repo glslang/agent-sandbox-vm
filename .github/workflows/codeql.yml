@@ -20,6 +20,8 @@ jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
     runs-on: ${{ matrix.runner }}
+    # security-events: write lets github/codeql-action/analyze upload SARIF
+    # results to code scanning; the rest stay read-only.
     permissions:
       security-events: write
       actions: read
@@ -40,7 +42,13 @@ jobs:
             runner: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # Pinned to a commit SHA per GitHub's supply-chain guidance for
+        # third-party actions. The CodeQL actions below intentionally stay on
+        # the @v4 major tag, as GitHub recommends for codeql-action.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # No step pushes, so don't persist the token for later steps.
+          persist-credentials: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
