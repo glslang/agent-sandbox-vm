@@ -333,14 +333,19 @@ extension VMCTL {
             throw VMToolError.invalidState("VM '\(name)' is already running.")
         }
 
-        let app = RunApp(
-            paths: paths,
-            vmConfiguration: vmConfig,
-            title: "\(config.name) (\(config.guest.rawValue))",
-            runLock: runLock
-        )
-        withExtendedLifetime(app) {
-            app.start()
+        // The `run` command executes on the process's main thread (synchronous
+        // `@main`), and `RunApp` is main-actor isolated, so build and drive it on
+        // the main actor.
+        MainActor.assumeIsolated {
+            let app = RunApp(
+                paths: paths,
+                vmConfiguration: vmConfig,
+                title: "\(config.name) (\(config.guest.rawValue))",
+                runLock: runLock
+            )
+            withExtendedLifetime(app) {
+                app.start()
+            }
         }
     }
 
@@ -968,6 +973,11 @@ func downloadFile(from url: URL, to destination: URL, attempts: Int) throws {
 /// Hosts the running VM in an AppKit window, owns the run lock for the session,
 /// and coordinates graceful shutdown (window close / signal → guest stop request
 /// → forced stop) before terminating the process.
+///
+/// Main-actor isolated: it is the `NSApplicationDelegate`, drives the AppKit run
+/// loop, and the VM is created on (and only used from) the main queue, so its
+/// `VZVirtualMachineDelegate` callbacks also arrive on the main thread.
+@MainActor
 final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtualMachineDelegate {
     private let paths: VMPaths
     private let vmConfiguration: VZVirtualMachineConfiguration
@@ -987,6 +997,7 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
     }
 
     /// Configures and runs the AppKit application (blocks until termination).
+    /// Invoked once from the `run` command on the main thread.
     func start() {
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
@@ -1054,14 +1065,16 @@ final class RunApp: NSObject, NSApplicationDelegate, NSWindowDelegate, VZVirtual
     }
 
     /// Guest stopped cleanly — tear down and exit.
-    func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-        cleanupAndTerminate()
+    /// `VZVirtualMachineDelegate` is non-isolated; this fires on the VM's main
+    /// delegate queue, so hop onto the main actor to run the teardown.
+    nonisolated func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        MainActor.assumeIsolated { cleanupAndTerminate() }
     }
 
     /// Guest stopped with an error — report it, then tear down and exit.
-    func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
+    nonisolated func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         FileHandle.standardError.write(Data("VM stopped with error: \(error.localizedDescription)\n".utf8))
-        cleanupAndTerminate()
+        MainActor.assumeIsolated { cleanupAndTerminate() }
     }
 
     /// Routes SIGTERM/SIGINT into a graceful stop on the main queue.
