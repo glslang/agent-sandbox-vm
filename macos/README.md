@@ -104,6 +104,11 @@ Current limitations:
 
 Use Parallels, VMware Fusion, or UTM/QEMU if Windows parity is the primary requirement.
 
+For a scoped analysis of what real Windows-on-ARM support would take — including why it requires
+dropping from `Virtualization.framework` to the low-level `Hypervisor.framework`, a component-level
+gap analysis, and a build-vs-wrap recommendation — see
+[docs/Windows-VMM-Feasibility.md](docs/Windows-VMM-Feasibility.md).
+
 ## CLI Reference
 
 ```bash
