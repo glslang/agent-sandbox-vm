@@ -132,13 +132,15 @@ Inside the VM/debuggee, run as Administrator with the debugger machine IP and th
 powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebuggee.ps1 -DebuggerHostIp <debugger-ip> -Key <key>
 ```
 
+This also enables test signing (`bcdedit /set testsigning on`) so test-signed drivers can load on the debuggee. Pass `-SkipTestSigning` to leave test signing untouched.
+
 Reboot the debuggee VM, then start WinDbg on the debugger machine with the command printed by `Setup-KernelDebugger.ps1`:
 
 ```powershell
 windbgx -k net:port=50000,key=<key>
 ```
 
-To disable kernel debugging inside the VM:
+To disable kernel debugging and test signing inside the VM:
 
 ```powershell
 powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebuggee.ps1 -Disable

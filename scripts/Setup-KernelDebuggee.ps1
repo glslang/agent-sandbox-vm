@@ -25,6 +25,11 @@ param(
     [ValidatePattern('^[0-9a-zA-Z]{1,13}(\.[0-9a-zA-Z]{1,13}){3}$')]
     [string]$Key,
 
+    # Leave test signing untouched. By default this script enables test signing
+    # so test-signed drivers can load on the debuggee.
+    [Parameter(ParameterSetName = "Enable")]
+    [switch]$SkipTestSigning,
+
     # Disable kernel debugging on this VM.
     [Parameter(Mandatory = $true, ParameterSetName = "Disable")]
     [switch]$Disable
@@ -82,8 +87,13 @@ if ($Disable) {
             -Arguments @("/debug", "off") `
             -Description "bcdedit /debug off"
 
+        Invoke-NativeCommand `
+            -Command "bcdedit" `
+            -Arguments @("/set", "testsigning", "off") `
+            -Description "bcdedit /set testsigning off"
+
         Write-Host ""
-        Write-Host "Kernel debugging disabled. Reboot the VM for the change to take effect."
+        Write-Host "Kernel debugging and test signing disabled. Reboot the VM for the change to take effect."
     } else {
         Write-Host ""
         Write-Host "Kernel debugging was not changed."
@@ -114,6 +124,19 @@ if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and config
         -Command "bcdedit" `
         -Arguments @("/dbgsettings", "net", "hostip:$DebuggerHostIp", "port:$Port", "key:$Key") `
         -Description "bcdedit /dbgsettings net"
+
+    if ($SkipTestSigning) {
+        Write-Host ""
+        Write-Host "Skipped test signing (-SkipTestSigning specified)."
+    } else {
+        Invoke-NativeCommand `
+            -Command "bcdedit" `
+            -Arguments @("/set", "testsigning", "on") `
+            -Description "bcdedit /set testsigning on"
+
+        Write-Host ""
+        Write-Host "Test signing enabled; test-signed drivers can load after reboot."
+    }
 
     Write-Host ""
     Write-Host "Kernel debuggee setup ready."
