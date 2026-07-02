@@ -146,6 +146,8 @@ To disable kernel debugging and test signing inside the VM:
 powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebuggee.ps1 -Disable
 ```
 
+Pass `-SkipTestSigning` on the disable path too to turn off kernel debugging while leaving the current test-signing boot policy unchanged (for example, when test signing was enabled independently of this script).
+
 After the debuggee VM shuts down, Secure Boot can be restored on the Hyper-V host:
 
 ```powershell

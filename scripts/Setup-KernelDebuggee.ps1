@@ -25,9 +25,13 @@ param(
     [ValidatePattern('^[0-9a-zA-Z]{1,13}(\.[0-9a-zA-Z]{1,13}){3}$')]
     [string]$Key,
 
-    # Leave test signing untouched. By default this script enables test signing
-    # so test-signed drivers can load on the debuggee.
+    # Leave test signing untouched. On enable, this script normally turns test
+    # signing on so test-signed drivers can load; on disable, it normally turns
+    # it back off. Pass this switch on either path to leave the current
+    # test-signing boot policy unchanged (for example, when test signing was
+    # enabled independently of this script).
     [Parameter(ParameterSetName = "Enable")]
+    [Parameter(ParameterSetName = "Disable")]
     [switch]$SkipTestSigning,
 
     # Disable kernel debugging on this VM.
@@ -87,13 +91,18 @@ if ($Disable) {
             -Arguments @("/debug", "off") `
             -Description "bcdedit /debug off"
 
-        Invoke-NativeCommand `
-            -Command "bcdedit" `
-            -Arguments @("/set", "testsigning", "off") `
-            -Description "bcdedit /set testsigning off"
+        if ($SkipTestSigning) {
+            Write-Host ""
+            Write-Host "Kernel debugging disabled; left test signing untouched (-SkipTestSigning specified). Reboot the VM for the change to take effect."
+        } else {
+            Invoke-NativeCommand `
+                -Command "bcdedit" `
+                -Arguments @("/set", "testsigning", "off") `
+                -Description "bcdedit /set testsigning off"
 
-        Write-Host ""
-        Write-Host "Kernel debugging and test signing disabled. Reboot the VM for the change to take effect."
+            Write-Host ""
+            Write-Host "Kernel debugging and test signing disabled. Reboot the VM for the change to take effect."
+        }
     } else {
         Write-Host ""
         Write-Host "Kernel debugging was not changed."
