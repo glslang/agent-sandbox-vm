@@ -25,7 +25,7 @@ SIZE_ARGS=()
 usage() {
   cat >&2 <<EOF
 Usage: Bootstrap.sh --name <vm> (--iso <win-arm64.iso> | --build-iso)
-         [--version <name>] [--arch arm64|amd64]
+         [--version <name>] [--arch arm64]
          [--cpus N] [--memory GB] [--disk-size GB]
          [--skip-provision] [--skip-snapshot] [--rearm-updates]
 EOF
@@ -52,6 +52,11 @@ done
 
 [[ -n "$NAME" ]] || usage
 [[ -n "$ISO" || "$BUILD_ISO" == "true" ]] || { echo "Provide --iso <path> or --build-iso" >&2; usage; }
+# This whole workflow is Windows-on-ARM: the VM is created as win-11 on Apple
+# Silicon and the install uses autounattend.arm64.xml (ARM64 image selector).
+# An amd64 ISO would burn the long download/build only to fail at install.
+[[ "$ARCH" == "arm64" ]] \
+  || die "Bootstrap.sh is ARM64-only (--arch $ARCH given). Build non-ARM ISOs with New-WindowsISO.sh directly."
 
 if [[ "$BUILD_ISO" == "true" ]]; then
   info "Step 1/4: Building Windows ISO from UUP dump"
@@ -86,6 +91,9 @@ fi
 
 if [[ "$SKIP_SNAPSHOT" != "true" && "$SKIP_PROVISION" != "true" ]]; then
   "$SCRIPT_DIR/Save-BaseSnapshot.sh" --name "$NAME"
+elif [[ "$SKIP_SNAPSHOT" != "true" ]]; then
+  log "Skipping base snapshot: it captures the PROVISIONED state, and --skip-provision was given."
+  log "Run ./Save-BaseSnapshot.sh --name \"$NAME\" after provisioning."
 fi
 
 info "Bootstrap complete for '$NAME'"

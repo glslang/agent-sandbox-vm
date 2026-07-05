@@ -103,10 +103,29 @@
     <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
+        <!-- Listed in execution order (Windows Setup runs these by <Order>). -->
         <RunSynchronousCommand wcm:action="add">
           <Description>Disable automatic BitLocker drive encryption</Description>
           <Order>1</Order>
           <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Description>Install Parallels Toolgate driver</Description>
+          <Order>2</Order>
+          <Path>cmd /q /C "FOR %I IN (A D E F G H I J K L N M O P Q R S T U V W X Y Z) DO IF EXIST %I:\prl_tg\DrvInARM64.exe %I:\prl_tg\DrvInARM64.exe -installPrlTg %I:\prl_tg\arm64\prl_tg.inf"</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Description>Stage Parallels Guest Tools installer</Description>
+          <Order>3</Order>
+          <Path>cmd /q /C "FOR %I IN (A D E F G H I J K L N M O P Q R S T U V W X Y Z) DO IF EXIST %I:\IGT_ARM64.exe COPY %I:\IGT_ARM64.exe %TEMP%\IGT.exe"</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Description>Install Parallels Guest Tools (silent)</Description>
+          <Order>4</Order>
+          <Path>%TEMP%\IGT.exe</Path>
           <WillReboot>Never</WillReboot>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
@@ -129,24 +148,6 @@
           <Description>Disable automatic Windows Update (no mid-provision restart)</Description>
           <Order>6</Order>
           <Path>reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v NoAutoUpdate /t REG_DWORD /d 1 /f</Path>
-          <WillReboot>Never</WillReboot>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Description>Install Parallels Toolgate driver</Description>
-          <Order>2</Order>
-          <Path>cmd /q /C "FOR %I IN (A D E F G H I J K L N M O P Q R S T U V W X Y Z) DO IF EXIST %I:\prl_tg\DrvInARM64.exe %I:\prl_tg\DrvInARM64.exe -installPrlTg %I:\prl_tg\arm64\prl_tg.inf"</Path>
-          <WillReboot>Never</WillReboot>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Description>Stage Parallels Guest Tools installer</Description>
-          <Order>3</Order>
-          <Path>cmd /q /C "FOR %I IN (A D E F G H I J K L N M O P Q R S T U V W X Y Z) DO IF EXIST %I:\IGT_ARM64.exe COPY %I:\IGT_ARM64.exe %TEMP%\IGT.exe"</Path>
-          <WillReboot>Never</WillReboot>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Description>Install Parallels Guest Tools (silent)</Description>
-          <Order>4</Order>
-          <Path>%TEMP%\IGT.exe</Path>
           <WillReboot>Never</WillReboot>
         </RunSynchronousCommand>
       </RunSynchronous>

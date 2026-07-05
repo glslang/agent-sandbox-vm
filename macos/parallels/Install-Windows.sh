@@ -94,7 +94,9 @@ info "Disconnecting install media"
 "$PRLCTL" set "$NAME" --device-bootorder "hdd0 cdrom0" >/dev/null 2>&1 || true
 
 info "Windows installed and reachable via prlctl exec"
-log "Verify: prlctl exec \"$NAME\" --user $GUEST_USER --password $GUEST_PASSWORD cmd /c ver"
+# Do not echo the actual password -- harmless for the default Admin/Admin, but
+# a credential leak into terminal/CI logs the moment someone overrides it.
+log "Verify: prlctl exec \"$NAME\" --user $GUEST_USER --password <GuestPassword from config.json> cmd /c ver"
 log ""
 log "Next:"
 log "  ./Start-Provision.sh --name \"$NAME\"      # install the toolchain"

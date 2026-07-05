@@ -13,7 +13,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 require_prlctl
 
 NAME=""
-LABEL="$SNAPSHOT_LABEL"
+LABEL=""     # default resolved AFTER load_config, so a persisted SnapshotLabel wins
 DESCRIPTION="Clean provisioned base (Windows + toolchain + Parallels Tools)"
 
 usage() {
@@ -34,6 +34,7 @@ done
 [[ -n "$NAME" ]] || usage
 require_vm_config "$NAME"
 load_config "$NAME"
+[[ -n "$LABEL" ]] || LABEL="$SNAPSHOT_LABEL"
 
 state="$(vm_state "$NAME")"
 if [[ "$state" != "stopped" ]]; then
@@ -46,7 +47,13 @@ if [[ "$state" != "stopped" ]]; then
 fi
 
 info "Creating snapshot '$LABEL'"
-out="$("$PRLCTL" snapshot "$NAME" --name "$LABEL" -d "$DESCRIPTION" 2>&1)"
+# Capture-and-check rather than a bare assignment: under `set -e` a failing
+# `prlctl snapshot` would exit the script before its output (the reason) is
+# ever shown.
+if ! out="$("$PRLCTL" snapshot "$NAME" --name "$LABEL" -d "$DESCRIPTION" 2>&1)"; then
+  printf '%s\n' "$out" >&2
+  die "prlctl snapshot failed for '$NAME'."
+fi
 printf '%s\n' "$out"
 
 # prlctl prints: "The snapshot with id {UUID} has been successfully created."
