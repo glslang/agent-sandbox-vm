@@ -11,6 +11,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+require_prlctl
 
 NAME=""
 CPUS=4
@@ -36,6 +37,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$NAME" ]] || usage
+# Validate sizing before arithmetic expansion: bash evaluates a non-numeric
+# string in $(( )) as 0, which would silently configure a 0 MB VM.
+[[ "$CPUS" =~ ^[1-9][0-9]*$ ]]      || die "--cpus must be a positive integer, got '$CPUS'."
+[[ "$MEMORY_GB" =~ ^[1-9][0-9]*$ ]] || die "--memory must be a positive integer (GB), got '$MEMORY_GB'."
+[[ "$DISK_GB" =~ ^[1-9][0-9]*$ ]]   || die "--disk-size must be a positive integer (GB), got '$DISK_GB'."
 vm_exists "$NAME" && die "A Parallels VM named '$NAME' already exists. Delete it first or pick another name."
 
 [[ -n "$SHARED_PATH" ]] || SHARED_PATH="$(vm_shared_dir "$NAME")"

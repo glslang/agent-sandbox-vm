@@ -10,6 +10,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+require_prlctl
 
 NAME=""
 LABEL="$SNAPSHOT_LABEL"
@@ -38,6 +39,10 @@ state="$(vm_state "$NAME")"
 if [[ "$state" != "stopped" ]]; then
   info "Shutting down '$NAME' for a clean snapshot"
   "$PRLCTL" stop "$NAME" >/dev/null 2>&1 || "$PRLCTL" stop "$NAME" --kill >/dev/null 2>&1 || true
+  # `prlctl stop` can return before the guest has fully shut down; never
+  # snapshot a transitional state.
+  wait_for_stopped "$NAME" 180 \
+    || die "VM '$NAME' did not reach 'stopped' within 180s; not snapshotting a transitional state."
 fi
 
 info "Creating snapshot '$LABEL'"

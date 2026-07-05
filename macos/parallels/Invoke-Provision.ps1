@@ -35,7 +35,7 @@ Write-Host "  Agent Sandbox VM (Parallels/ARM64) -- Provisioning"
 Write-Host "----------------------------------------------"
 Write-Host ""
 
-function Refresh-Path {
+function Update-Path {
     $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("PATH", "User")
 }
@@ -46,12 +46,12 @@ function Add-MachinePath {
     if (($machine -split ';') -notcontains $Dir) {
         [System.Environment]::SetEnvironmentVariable("PATH", "$machine;$Dir", "Machine")
     }
-    Refresh-Path
+    Update-Path
 }
 
 function Assert-CommandAvailable {
     param([Parameter(Mandatory)][string]$Name, [string]$InstallHint = "")
-    Refresh-Path
+    Update-Path
     $command = Get-Command $Name -ErrorAction SilentlyContinue
     if (-not $command) {
         $message = "Expected command '$Name' was not found on PATH after installation."
@@ -162,7 +162,7 @@ Write-Host "  VS Build Tools installed. cl.exe: $($clExe.FullName)"
 Write-Host "[5/8] Installing Rust (aarch64-pc-windows-msvc)..."
 Invoke-Download "https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe" "$env:TEMP\rustup-init.exe"
 & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --default-host aarch64-pc-windows-msvc
-Refresh-Path
+Update-Path
 rustup component add clippy rustfmt
 Write-Host "  Rust installed: $(rustc --version)"
 
@@ -175,7 +175,7 @@ try {
         $gitExe = "$env:TEMP\git-arm64.exe"
         Invoke-Download $gitAsset.browser_download_url $gitExe
         Start-Process $gitExe -ArgumentList "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-", "/SUPPRESSMSGBOXES" -Wait
-        Refresh-Path
+        Update-Path
         $gitBashExe = @(
             "C:\Program Files\Git\bin\bash.exe",
             "C:\Program Files\Git\usr\bin\bash.exe"
@@ -203,7 +203,7 @@ try {
         $ghMsi = "$env:TEMP\gh-arm64.msi"
         Invoke-Download $ghAsset.browser_download_url $ghMsi
         Start-Process msiexec.exe -ArgumentList "/i", "`"$ghMsi`"", "/qn", "/norestart" -Wait
-        Refresh-Path
+        Update-Path
         Write-Host "  GitHub CLI installed."
     } else {
         Write-Warning "  No ARM64 gh MSI found; skipping."
@@ -215,10 +215,10 @@ try {
 # -- 6. Claude Code + Codex CLI (npm global) --
 Write-Host "[8/8] Installing Claude Code + Codex CLI..."
 & "$nodeDest\npm.cmd" install -g @anthropic-ai/claude-code
-Refresh-Path
+Update-Path
 Write-Host "  Claude Code installed: $(claude --version)"
 & "$nodeDest\npm.cmd" install -g @openai/codex
-Refresh-Path
+Update-Path
 try { Write-Host "  Codex CLI installed: $(codex --version)" } catch { Write-Warning "  Codex CLI check failed: $($_.Exception.Message)" }
 
 # -- Workspace --

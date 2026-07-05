@@ -94,7 +94,7 @@ if [[ -n "$BUILD_ID" ]]; then
   log "[1/4] Using pinned build: $BUILD_ID"
 else
   log "[1/4] Searching UUP dump for '$VERSION' ($ARCH)..."
-  search_json="$(curl -fsSL "$API/listid.php?search=$(printf '%s' "$VERSION" | jq -sRr @uri)&sortByDate=1")" \
+  search_json="$(curl -fsSL --connect-timeout 15 --max-time 120 "$API/listid.php?search=$(printf '%s' "$VERSION" | jq -sRr @uri)&sortByDate=1")" \
     || die "UUP dump search failed. Browse https://uupdump.net/known.php for valid names."
   BUILD_UUID="$(printf '%s' "$search_json" \
     | jq -r --arg arch "$ARCH" '[.response.builds[] | select(.arch==$arch)] | sort_by(.created) | reverse | .[0].uuid // empty')"
@@ -108,7 +108,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ -z "$EDITION" ]]; then
   log "[2/4] Querying available editions..."
-  ed_json="$(curl -fsSL "$API/listeditions.php?lang=$LANGUAGE&id=$BUILD_UUID")" \
+  ed_json="$(curl -fsSL --connect-timeout 15 --max-time 120 "$API/listeditions.php?lang=$LANGUAGE&id=$BUILD_UUID")" \
     || die "UUP dump edition listing failed for build $BUILD_UUID."
   editions="$(printf '%s' "$ed_json" | jq -r '.response.editionList[]?' 2>/dev/null || true)"
   [[ -n "$editions" ]] || die "No editions reported for build $BUILD_UUID (language $LANGUAGE)."
@@ -131,7 +131,9 @@ ZIP="$WORKDIR/uup-package.zip"
 # autodl=2 -> package that downloads UUP files and converts to ISO;
 # updates=1 -> integrate updates; cleanup=1 -> delete UUP files after conversion.
 edition_lc="$(printf '%s' "$EDITION" | tr '[:upper:]' '[:lower:]')"
-curl -fsSL -X POST \
+# The package is a small script bundle (the multi-GB UUP download happens later
+# via aria2 inside the converter), so a bounded overall timeout is safe here.
+curl -fsSL --connect-timeout 15 --max-time 300 -X POST \
   "https://uupdump.net/get.php?id=$BUILD_UUID&pack=$LANGUAGE&edition=$edition_lc" \
   --data "autodl=2&updates=1&cleanup=1" -o "$ZIP" \
   || die "Failed to download the conversion package."
