@@ -62,7 +62,17 @@ log "Configuring $CPUS vCPU / ${MEMORY_GB} GB RAM / ${DISK_GB} GB disk..."
   warn "Could not confirm Secure Boot state (Parallels usually enables it for win-11)."
 
 log "Sharing host folder into the guest as \\\\Mac\\${SHARED_NAME}..."
+# Share ONLY the per-VM workspace dir. Parallels' host-defined defaults can
+# also mount the user's home (or all host disks), the Mac user profile
+# (Desktop/Documents/...), cloud folders, and auto-mounted external volumes
+# into the guest -- enabling user-defined shares does NOT clear those, so turn
+# each one off explicitly or the "isolated" sandbox can read the whole host.
 "$PRLCTL" set "$NAME" --shf-host on
+"$PRLCTL" set "$NAME" --shf-host-defined off
+"$PRLCTL" set "$NAME" --shared-profile off
+"$PRLCTL" set "$NAME" --shared-cloud off
+"$PRLCTL" set "$NAME" --smart-mount off
+"$PRLCTL" set "$NAME" --shf-guest off
 "$PRLCTL" set "$NAME" --shf-host-add "$SHARED_NAME" --path "$SHARED_PATH/workspace" --mode rw
 
 log "Enabling shared (NAT) networking for install + provisioning..."
