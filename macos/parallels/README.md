@@ -34,12 +34,14 @@ Option D).
   EULA version.
 - For building an ISO from UUP dump (`New-WindowsISO.sh`), Homebrew tools — the
   macOS equivalent of Windows' built-in DISM:
+
   ```sh
   brew install aria2 wimlib cabextract jq cdrtools   # or: xorriso instead of cdrtools
   # chntpw is no longer in Homebrew core; use the tap that builds on Apple Silicon:
   brew tap minacle/chntpw && brew install minacle/chntpw/chntpw
   # (MacPorts alternative: sudo port install chntpw)
   ```
+
   You can skip this entirely by bringing your own Windows 11 **ARM64** ISO.
 
 ## Quick start

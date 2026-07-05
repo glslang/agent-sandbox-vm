@@ -16,6 +16,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
+# NOTE: config values must not contain '"' or '\' -- the lightweight json_get
+# reader cannot unescape them, so write_config rejects such values (see below).
 : "${GUEST_USER:=Admin}"          # created + auto-logged-in by autounattend.arm64.xml
 : "${GUEST_PASSWORD:=Admin}"      # isolated sandbox; matches the checked-in answer file
 : "${SHARED_NAME:=workspace}"     # Parallels shared-folder name -> guest \\Mac\workspace
@@ -41,7 +43,14 @@ require_cmd() {
 }
 
 PRLCTL="${PRLCTL:-prlctl}"
-require_cmd "$PRLCTL" "Install Parallels Desktop (https://www.parallels.com)."
+
+# Called explicitly by the scripts that actually drive prlctl (create/install/
+# provision/snapshot/session) -- NOT at source time, so prlctl-free consumers
+# like New-WindowsISO.sh work on a machine without Parallels Desktop installed
+# (build the ISO first, install Parallels later).
+require_prlctl() {
+  require_cmd "$PRLCTL" "Install Parallels Desktop (https://www.parallels.com)."
+}
 
 # Resolve the Parallels Desktop app bundle Tools directory (holds igt_arm64.exe,
 # prl_tg/, and the prl-tools-win-arm.iso used for the guest-tools bootstrap).
@@ -100,10 +109,21 @@ load_config() {
 # JSON-escape a string value (backslash + double-quote).
 json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
 
+# json_get cannot UNescape what json_escape writes, so any value containing '"'
+# or '\' would come back mangled on the next load (silently corrupting e.g. an
+# overridden GuestPassword). Reject such values loudly instead.
+assert_json_roundtrip_safe() {  # assert_json_roundtrip_safe <key> <value>
+  case "$2" in
+    *'"'*|*'\'*) die "Config value for '$1' contains '\"' or '\\', which cannot round-trip through this flat JSON config: $2" ;;
+  esac
+}
+
 # write_config <name> <k1> <v1> [<k2> <v2> ...] : merge keys into config.json.
 # Bash 3.2 compatible (no associative arrays -- macOS ships /bin/bash 3.2). Only
 # the fixed, known keys are stored; the guest share UNC is derived, not stored,
 # because its backslashes cannot round-trip through the lightweight json_get.
+# All stored values are validated by assert_json_roundtrip_safe for the same
+# reason -- see the NOTE at the GUEST_USER/GUEST_PASSWORD defaults.
 write_config() {
   local name="$1"; shift
   local dir f; dir="$(vm_config_dir "$name")"; f="$dir/config.json"
@@ -141,6 +161,14 @@ write_config() {
     esac
   done
 
+  assert_json_roundtrip_safe VMName         "$v_VMName"
+  assert_json_roundtrip_safe GuestUser      "$v_GuestUser"
+  assert_json_roundtrip_safe GuestPassword  "$v_GuestPassword"
+  assert_json_roundtrip_safe SharedName     "$v_SharedName"
+  assert_json_roundtrip_safe SharedHostPath "$v_SharedHostPath"
+  assert_json_roundtrip_safe SnapshotLabel  "$v_SnapshotLabel"
+  assert_json_roundtrip_safe SnapshotId     "$v_SnapshotId"
+
   {
     printf '{\n'
     printf '  "VMName": "%s",\n'         "$(json_escape "$v_VMName")"
@@ -168,6 +196,17 @@ vm_state() { "$PRLCTL" status "$1" 2>/dev/null | awk '{print $NF}'; }
 guest_exec() {  # guest_exec <name> <command...>
   local name="$1"; shift
   "$PRLCTL" exec "$name" --user "$GUEST_USER" --password "$GUEST_PASSWORD" "$@"
+}
+
+# Wait until the VM reaches 'stopped' -- `prlctl stop` can return before the
+# shutdown completes, and snapshot/snapshot-switch on a transitional VM is racy.
+wait_for_stopped() {  # wait_for_stopped <name> [timeout_seconds]
+  local name="$1" timeout="${2:-180}" waited=0 step=3
+  while (( waited < timeout )); do
+    [[ "$(vm_state "$name")" == "stopped" ]] && return 0
+    sleep "$step"; waited=$((waited + step))
+  done
+  return 1
 }
 
 # Wait until the guest answers over Parallels Tools (i.e. Tools + Toolgate are up).

@@ -12,6 +12,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+require_prlctl
 
 NAME=""
 PROJECT=""
@@ -67,6 +68,9 @@ if [[ "$RESTORE" == "true" ]]; then
   [[ -n "$sid" ]] || die "No snapshot id for label '$LABEL'. Run Save-BaseSnapshot.sh, or pass --snapshot-id <id> (see: prlctl snapshot-list \"$NAME\")."
   if [[ "$(vm_state "$NAME")" != "stopped" ]]; then
     "$PRLCTL" stop "$NAME" >/dev/null 2>&1 || "$PRLCTL" stop "$NAME" --kill >/dev/null 2>&1 || true
+    # `prlctl stop` can return before shutdown completes; snapshot-switch on a
+    # transitional VM is racy.
+    wait_for_stopped "$NAME" 180 || die "VM '$NAME' did not stop within 180s; cannot restore the snapshot."
   fi
   info "Restoring snapshot '$LABEL' ($sid)"
   "$PRLCTL" snapshot-switch "$NAME" --id "$sid" --skip-resume

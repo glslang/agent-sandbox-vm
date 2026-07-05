@@ -8,6 +8,9 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+# Bootstrap drives VM create/install/provision/snapshot -- fail fast up front
+# rather than after a potentially hour-long ISO build.
+require_prlctl
 
 NAME=""
 ISO=""
