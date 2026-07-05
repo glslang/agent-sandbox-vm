@@ -1,9 +1,11 @@
 # Feasibility: Native Windows-on-ARM via `Hypervisor.framework`
 
-> **Status:** analysis / scoping only. Nothing here is implemented. `vmctl` boots guests through
-> the high-level `Virtualization.framework` (VZ) today; this document scopes what it would take to
-> support a *supported* Windows 11 ARM64 guest by dropping to the low-level `Hypervisor.framework`
-> (HVF) instead.
+> **Status:** the `Hypervisor.framework` analysis below (options A–C) is scoping only and is **not**
+> implemented — `vmctl` still boots guests through the high-level `Virtualization.framework` (VZ).
+> Since this was written, **option D (wrap Parallels Desktop via `prlctl`) has been implemented** in
+> [`../parallels/`](../parallels/) as the practical way to run a supported Windows 11 ARM64 guest on
+> Apple Silicon. This document scopes what a *native* VMM would take (dropping to the low-level
+> `Hypervisor.framework`, HVF) and why wrapping an existing VMM wins.
 
 ## Verdict up front
 
@@ -13,9 +15,12 @@ EDK2 firmware + swtpm + the virtio-win driver story**. It is unquestionably *pos
 QEMU do exactly this on the same HVF API — but it is wildly out of proportion to what this toolkit
 is.
 
-**Recommendation:** if Windows support is genuinely wanted, **wrap UTM/QEMU** (option B below) —
-same HVF underneath, but all the hard parts are already solved and maintained. Otherwise keep the
-status quo (VZ generic-EFI marked experimental, users pointed at Parallels/UTM). A from-scratch VMM
+**Recommendation:** if Windows support is genuinely wanted, **wrap Parallels Desktop** (option D
+below — now implemented in [`../parallels/`](../parallels/)). Parallels is the Microsoft-authorized
+Win11-ARM VMM and already ships vTPM, Secure Boot, signed guest tools, and snapshots, all driven
+from a scriptable CLI (`prlctl`); wrapping it is days of shell glue, not the person-years of a
+from-scratch VMM. Wrapping UTM/QEMU (option B) is the fallback if a commercial dependency is
+unacceptable. Otherwise keep the status quo (VZ generic-EFI marked experimental). A from-scratch VMM
 (option A) is not recommended for this repo.
 
 ---
@@ -121,27 +126,44 @@ depends on the components proven by the previous one.
   snapshot conventions. **Weeks, not years.** This is already what the README recommends.
 - **C — Status quo.** Keep VZ generic-EFI labelled experimental and point users to Parallels/UTM.
   Zero new maintenance.
+- **D — Wrap Parallels Desktop (implemented in [`../parallels/`](../parallels/)).** Instead of
+  driving virtualization ourselves, orchestrate `prlctl` — Parallels' scriptable CLI. Parallels is
+  built on HVF too, but it *is* the Microsoft-authorized Win11-ARM VMM and ships the entire hard
+  stack (UEFI, ACPI, vTPM 2.0, Secure Boot, **signed** guest tools, snapshots) as a product. Every
+  lifecycle verb maps to a primitive: `prlctl create -d win-11`, `prlctl exec` (≈ PowerShell
+  Direct), shared folders (≈ `Copy-Item -ToSession`), `prlctl snapshot*` (≈ checkpoints),
+  `--device-set net0 --type ...` (isolated ↔ internet). Unattended install reuses the answer-file
+  approach (Windows Setup reads `Autounattend.xml` from removable media) plus Parallels' own
+  `IGT_ARM64.exe`/`prl_tg` guest-tools bootstrap. **Effort: days of shell glue.** The cost is a
+  runtime dependency on a commercial product (a Parallels license), the same "is a runtime dep
+  acceptable?" question option B raises — but with the licensing grey area removed.
 
-| Criterion | A: from-scratch HVF | B: wrap UTM/QEMU | C: status quo |
-|-----------|---------------------|------------------|---------------|
-| Effort | Multi-person-year | Weeks | None |
-| Control over the stack | Total | Moderate (QEMU's choices) | N/A |
-| Licensing risk | High (grey area) | Medium | None (defer to user's tool) |
-| Ongoing maintenance | Very high | Medium | None |
-| Fit with repo's "native VZ" identity | Poor (huge divergence) | Medium (adds a runtime dep) | Perfect |
+| Criterion | A: from-scratch HVF | B: wrap UTM/QEMU | C: status quo | D: wrap Parallels |
+|-----------|---------------------|------------------|---------------|-------------------|
+| Effort | Multi-person-year | Weeks | None | Days (glue) |
+| Control over the stack | Total | Moderate (QEMU's choices) | N/A | Low (Parallels' choices) |
+| Licensing risk | High (grey area) | Medium | None (defer to user's tool) | None (authorized VMM) |
+| Ongoing maintenance | Very high | Medium | None | Low (track `prlctl`) |
+| Fit with repo's "native VZ" identity | Poor (huge divergence) | Medium (adds a runtime dep) | Perfect | Medium (commercial runtime dep) |
 
 ## 6. Recommendation & open decisions
 
-**Recommendation:** choose **B** if Windows support is a real requirement; otherwise **C**. Do not
-pursue **A** in this repository.
+**Recommendation:** if Windows support is a real requirement, choose **D** (wrap Parallels), now
+implemented in [`../parallels/`](../parallels/). It is the least code, carries no licensing risk, and
+inherits Parallels' maintained vTPM/Secure Boot/guest-tools/snapshot stack. Fall back to **B** only
+if a commercial runtime dependency is unacceptable but Windows is still required; otherwise **C**. Do
+not pursue **A** in this repository.
 
 Open questions the reader must answer before committing to anything:
 
 1. Is **ARM64-only** Windows acceptable? (Apple Silicon can't hardware-virtualize x86; x86 apps run
-   only under Windows' own emulation. There is no native x64 Windows guest.)
-2. Is the **Microsoft licensing** posture for Windows 11 ARM on a non-authorized VMM acceptable?
-3. Is a **QEMU/UTM runtime dependency** acceptable in a repo whose selling point is a *native*
-   `Virtualization.framework` implementation with no external hypervisor?
+   only under Windows' own emulation. There is no native x64 Windows guest.) This applies to **all**
+   options, D included.
+2. Is a **runtime dependency on a hypervisor process** acceptable in a repo whose selling point is a
+   *native* `Virtualization.framework` implementation? Option D depends on **Parallels Desktop** (a
+   paid, Microsoft-authorized product); option B depends on **QEMU/UTM** (open source, unauthorized
+   for Windows 11 ARM). The `../parallels/` tree is deliberately a **separate sibling** to the VZ
+   `vmctl` path, so the native identity of the default macOS path is preserved either way.
 
-If the answer to (3) is "no," the honest conclusion is **C** plus a clear pointer to Parallels/UTM —
-which is essentially where the project already stands.
+If neither runtime dependency is acceptable, the honest conclusion is **C** plus a clear pointer to
+Parallels/UTM.
