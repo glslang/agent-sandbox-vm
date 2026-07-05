@@ -170,8 +170,14 @@ chmod +x "$WORKDIR/pkg/"*.sh 2>/dev/null || true
 # when Bootstrap.sh captures this script's stdout for the ISO path).
 ( cd "$WORKDIR/pkg" && ./"$CONVERTER" ) >&2
 
-ISO="$(find "$WORKDIR/pkg" -maxdepth 1 -iname '*.iso' -type f -print0 \
-        | xargs -0 ls -S 2>/dev/null | head -1)"
+# Pick the largest ISO if the converter produced several. Handle the empty
+# case explicitly: piping an empty find into `xargs ls -S` would (with GNU
+# xargs on PATH) run `ls -S` on the cwd and hand back an unrelated file, which
+# the mv below would then relocate into the ISO output dir.
+ISO=""
+while IFS= read -r -d '' f; do
+  if [[ -z "$ISO" || "$(stat -f%z "$f")" -gt "$(stat -f%z "$ISO")" ]]; then ISO="$f"; fi
+done < <(find "$WORKDIR/pkg" -maxdepth 1 -iname '*.iso' -type f -print0)
 [[ -n "$ISO" ]] || die "No ISO was produced. Work dir kept at '$WORKDIR' -- re-run to resume (downloaded files are reused)."
 
 FINAL="$OUTPUT/$(basename "$ISO")"

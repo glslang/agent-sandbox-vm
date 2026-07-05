@@ -74,6 +74,11 @@ if [[ "$RESTORE" == "true" ]]; then
   fi
   info "Restoring snapshot '$LABEL' ($sid)"
   "$PRLCTL" snapshot-switch "$NAME" --id "$sid" --skip-resume
+  # A restore means "clean session". The snapshot only reverts the VM disk --
+  # the host-side shared folder is untouched, and the sync below deliberately
+  # excludes target/. Clear stale build output here so Copy-Artifacts.sh can
+  # never ship a previous session's binaries as if this session built them.
+  rm -rf "$SHARED_HOST_PATH/workspace/target"
 fi
 
 # ---------------------------------------------------------------------------
