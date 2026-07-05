@@ -101,7 +101,19 @@ case "$NETWORK" in
     "$PRLCTL" set "$NAME" --device-set net0 --type host-only --connect >/dev/null ;;
   isolated|none)
     info "Networking: isolated (adapter disconnected)"
-    "$PRLCTL" set "$NAME" --device-disconnect net0 >/dev/null 2>&1 || true ;;
+    # --device-set ... --disconnect changes the VM CONFIG, so it works on a
+    # stopped VM (the normal case right after --restore) and applies at boot.
+    # The runtime --device-disconnect form only works on a RUNNING VM -- and
+    # silently swallowing its failure would boot the snapshot's shared/NAT
+    # adapter state, giving an "isolated" session internet access.
+    "$PRLCTL" set "$NAME" --device-set net0 --disconnect >/dev/null \
+      || die "Failed to disconnect net0; refusing to start a non-isolated session."
+    # If the VM is already running, the config change may not apply until the
+    # next boot -- hot-disconnect the live adapter as well.
+    if [[ "$(vm_state "$NAME")" == "running" ]]; then
+      "$PRLCTL" set "$NAME" --device-disconnect net0 >/dev/null \
+        || die "Failed to hot-disconnect net0 on the running VM."
+    fi ;;
   *) die "Unknown network mode: $NETWORK (use shared|host-only|isolated)" ;;
 esac
 
