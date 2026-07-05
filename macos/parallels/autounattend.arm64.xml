@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  macos/parallels/autounattend.arm64.xml
+
+  Unattended-install answer file for Windows 11 ARM64 under Parallels Desktop.
+
+  Derived from Parallels' own express-install template that ships in the app
+  bundle at:
+    /Applications/Parallels Desktop.app/Contents/Resources/Tools/Autounattend_arm64.xml
+
+  What is reused verbatim from Parallels (proven on Apple Silicon):
+    * windowsPE disk layout  : wipe disk 0 -> EFI/MSR/primary, install ARM64
+                               image (/IMAGE/WINDOWS/ARCH = 9) to partition 4.
+    * specialize Tools setup : disable BitLocker auto-encryption, install the
+                               Parallels Toolgate driver (prl_tg\DrvInARM64.exe)
+                               and run the silent Guest Tools installer
+                               (IGT_ARM64.exe). These files are placed at the
+                               root of the answer ISO by Install-Windows.sh, so
+                               `prlctl exec` + shared folders come up with no GUI.
+
+  What this repo adds:
+    * A deterministic local Administrator account (Admin/Admin) with persistent
+      auto-logon, so Install-Windows.sh / Start-Provision.sh can drive the guest
+      over `prlctl exec` with the Admin credentials. If you change these, update
+      GuestUser/GuestPassword in the VM's config.json to match.
+
+  Delivered via removable media (a small ISO built by Install-Windows.sh), which
+  Windows Setup auto-scans for Autounattend.xml at boot; the macOS analog of the
+  Hyper-V path's offline DISM injection (scripts/Install-Windows.ps1).
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition><Order>1</Order><Type>Primary</Type><Size>300</Size></CreatePartition>
+            <CreatePartition><Order>2</Order><Type>EFI</Type><Size>300</Size></CreatePartition>
+            <CreatePartition><Order>3</Order><Type>MSR</Type><Size>128</Size></CreatePartition>
+            <CreatePartition><Order>4</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition>
+              <Order>1</Order><PartitionID>1</PartitionID>
+              <Format>NTFS</Format><Label>WinRE</Label>
+              <TypeID>de94bba4-06d1-4d40-a16a-bfd50179d6ac</TypeID>
+            </ModifyPartition>
+            <ModifyPartition>
+              <Order>2</Order><PartitionID>2</PartitionID>
+              <Format>FAT32</Format><Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition>
+              <Order>3</Order><PartitionID>4</PartitionID>
+              <Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+        <WillShowUI>OnError</WillShowUI>
+      </DiskConfiguration>
+      <UserData>
+        <ProductKey>
+          <!-- Generic Windows 11 Pro edition selector (not an activation key). -->
+          <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/WINDOWS/ARCH</Key>
+              <Value>9</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>4</PartitionID>
+          </InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+          <InstallToAvailablePartition>false</InstallToAvailablePartition>
+        </OSImage>
+      </ImageInstall>
+    </component>
+
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Description>Disable automatic BitLocker drive encryption</Description>
+          <Order>1</Order>
+          <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <!-- Give the auto-logon Admin a full (non-UAC-filtered) token so that
+               commands driven from the host via `prlctl exec` (VS Build Tools,
+               rustup, Set-ExecutionPolicy LocalMachine) run elevated. Acceptable
+               for an isolated build sandbox; takes effect after the next reboot. -->
+          <Description>Disable UAC admin-approval mode (sandbox)</Description>
+          <Order>5</Order>
+          <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v EnableLUA /t REG_DWORD /d 0 /f</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <!-- A fresh install immediately starts downloading updates, and an
+               automatic restart mid-provision kills the one-shot provisioning
+               task (Start-Provision.sh). Disable AUTOMATIC updates from first
+               boot; a manual Settings "Check for updates" still works. Kept off
+               deliberately: a snapshot-restored sandbox wants deterministic
+               restores and no surprise restarts during agent sessions. -->
+          <Description>Disable automatic Windows Update (no mid-provision restart)</Description>
+          <Order>6</Order>
+          <Path>reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v NoAutoUpdate /t REG_DWORD /d 1 /f</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Description>Install Parallels Toolgate driver</Description>
+          <Order>2</Order>
+          <Path>cmd /q /C "FOR %I IN (A D E F G H I J K L N M O P Q R S T U V W X Y Z) DO IF EXIST %I:\prl_tg\DrvInARM64.exe %I:\prl_tg\DrvInARM64.exe -installPrlTg %I:\prl_tg\arm64\prl_tg.inf"</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Description>Stage Parallels Guest Tools installer</Description>
+          <Order>3</Order>
+          <Path>cmd /q /C "FOR %I IN (A D E F G H I J K L N M O P Q R S T U V W X Y Z) DO IF EXIST %I:\IGT_ARM64.exe COPY %I:\IGT_ARM64.exe %TEMP%\IGT.exe"</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Description>Install Parallels Guest Tools (silent)</Description>
+          <Order>4</Order>
+          <Path>%TEMP%\IGT.exe</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+    <component name="Microsoft-Windows-SQMAPI" processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <CEIPEnabled>0</CEIPEnabled>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>Admin</Name>
+            <DisplayName>Admin</DisplayName>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>Admin</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Username>Admin</Username>
+        <Enabled>true</Enabled>
+        <LogonCount>999</LogonCount>
+        <Password>
+          <Value>Admin</Value>
+          <PlainText>true</PlainText>
+        </Password>
+      </AutoLogon>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>cmd /q /C "WMIC USERACCOUNT WHERE Name='Admin' SET PasswordExpires=FALSE"</CommandLine>
+          <Description>Never expire the Admin password</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+      <Display>
+        <ColorDepth>32</ColorDepth>
+        <HorizontalResolution>1920</HorizontalResolution>
+        <VerticalResolution>1200</VerticalResolution>
+      </Display>
+    </component>
+  </settings>
+</unattend>

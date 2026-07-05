@@ -88,13 +88,19 @@ If the build writes into the shared `workspace` directory, artifacts are already
 
 ## Windows Status
 
-You can create a generic EFI VM bundle for Windows experiments:
+**For a real Windows 11 ARM64 sandbox, use the Parallels workflow in
+[`parallels/`](parallels/)** — it installs Windows unattended, provisions the toolchain, snapshots a
+clean base, and drives the guest agentlessly over `prlctl exec`, reaching near parity with the
+Hyper-V path. That is the recommended path if Windows is what you need.
+
+The **`Virtualization.framework` (`vmctl`) path below** remains experimental and Windows-incapable by
+design. You can create a generic EFI VM bundle for experiments:
 
 ```bash
 ./macos/scripts/New-AgentVM.sh --guest windows --name AgentWinArm --iso /path/to/windows-arm64.iso
 ```
 
-Current limitations:
+Current limitations of the **VZ path** (the Parallels path in `parallels/` addresses all of these):
 
 - `install --name AgentWinArm` intentionally fails with an explanation.
 - A Windows ISO is recorded in VM metadata but is not automatically booted or installed.
@@ -102,7 +108,7 @@ Current limitations:
 - There is no PowerShell Direct equivalent; use WinRM, SSH, or a guest-supported shared-folder driver after the guest is provisioned.
 - No KDNET/Secure Boot/vTPM parity is implemented.
 
-Use Parallels, VMware Fusion, or UTM/QEMU if Windows parity is the primary requirement.
+Alternatively, VMware Fusion or UTM/QEMU also provide Windows guests.
 
 For a scoped analysis of what real Windows-on-ARM support would take — including why it requires
 dropping from `Virtualization.framework` to the low-level `Hypervisor.framework`, a component-level
