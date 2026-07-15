@@ -200,15 +200,19 @@ Write-Host "  uv installed: $(uv --version)"
 
 # Verify end to end that a virtual environment can actually be created, so a
 # broken Python/uv install fails here rather than in the agent's first session.
+# Windows PowerShell 5.1 does NOT turn a native command's non-zero exit into a
+# terminating error under $ErrorActionPreference = "Stop", so check $LASTEXITCODE
+# and the produced layout explicitly and throw -- otherwise a broken install
+# would leave the provisioner "succeeding" with no working Python.
 $uvVenvProbe = Join-Path $env:TEMP "uv-venv-probe"
 Remove-Item $uvVenvProbe -Recurse -Force -ErrorAction SilentlyContinue
 uv venv $uvVenvProbe | Out-Null
-if (Test-Path (Join-Path $uvVenvProbe "Scripts\python.exe")) {
-    Write-Host "  Verified: 'uv venv' creates a working virtual environment."
-} else {
-    Write-Warning "  'uv venv' did not produce the expected environment layout."
-}
+$uvVenvOk = ($LASTEXITCODE -eq 0) -and (Test-Path (Join-Path $uvVenvProbe "Scripts\python.exe"))
 Remove-Item $uvVenvProbe -Recurse -Force -ErrorAction SilentlyContinue
+if (-not $uvVenvOk) {
+    throw "'uv venv' did not create a working virtual environment (exit $LASTEXITCODE). The Python/uv install is broken."
+}
+Write-Host "  Verified: 'uv venv' creates a working virtual environment."
 
 # -- 7. Git for Windows (Git Bash) --
 Write-Host "[8/16] Installing Git for Windows..."
