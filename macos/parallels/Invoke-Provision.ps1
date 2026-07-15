@@ -74,7 +74,7 @@ function Invoke-Download {
 # raises a TERMINATING error ("...overridden by a policy defined at a more
 # specific scope"). That is thrown via ThrowTerminatingError, so -ErrorAction
 # SilentlyContinue does NOT suppress it -- only try/catch does.
-Write-Host "[1/8] Setting execution policy..."
+Write-Host "[1/9] Setting execution policy..."
 try {
     Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
     Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
@@ -92,7 +92,7 @@ try {
 # "Check for updates" in Settings still works -- only AUTOMATIC download/
 # install/restart is off, deliberately, so snapshot restores stay deterministic
 # and agent sessions never get surprise-rebooted.
-Write-Host "[2/8] Disabling automatic Windows Update (no mid-provision restart)..."
+Write-Host "[2/9] Disabling automatic Windows Update (no mid-provision restart)..."
 $au = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
 New-Item -Path $au -Force | Out-Null
 Set-ItemProperty -Path $au -Name NoAutoUpdate -Value 1 -Type DWord
@@ -100,7 +100,7 @@ Stop-Service -Name wuauserv, UsoSvc -Force -ErrorAction SilentlyContinue
 Write-Host "  Automatic updates disabled (manual check still available)."
 
 # -- 1. Node.js (ARM64 zip -- nodejs.org ships no arm64 MSI) --
-Write-Host "[3/8] Installing Node.js (ARM64 zip)..."
+Write-Host "[3/9] Installing Node.js (ARM64 zip)..."
 $nodeIndex = Invoke-RestMethod -Uri "https://nodejs.org/dist/index.json" -UseBasicParsing
 $nodeRel = $nodeIndex | Where-Object { $_.lts -and ($_.files -contains 'win-arm64-zip') } | Select-Object -First 1
 if (-not $nodeRel) { throw "No LTS Node.js release with a win-arm64-zip was found." }
@@ -135,7 +135,7 @@ Write-Host "  Node installed: $(node --version)  npm: $(npm --version)"
 # makes -Wait return as soon as the --wait bootstrapper exits, i.e. exactly when
 # the install is done. (Verified: identical args hang with -NoNewWindow, finish
 # in ~7 min without it.)
-Write-Host "[4/8] Installing VS Build Tools (ARM64) -- this takes ~10-20 min..."
+Write-Host "[4/9] Installing VS Build Tools (ARM64) -- this takes ~10-20 min..."
 $vsInstaller = "$env:TEMP\vs_buildtools.exe"
 Invoke-Download "https://aka.ms/vs/18/stable/vs_buildtools.exe" $vsInstaller
 $proc = Start-Process $vsInstaller -ArgumentList @(
@@ -159,15 +159,38 @@ if (-not $clExe) { throw "VS Build Tools: native ARM64 cl.exe not found under $v
 Write-Host "  VS Build Tools installed. cl.exe: $($clExe.FullName)"
 
 # -- 3. Rust (aarch64 MSVC toolchain) --
-Write-Host "[5/8] Installing Rust (aarch64-pc-windows-msvc)..."
+Write-Host "[5/9] Installing Rust (aarch64-pc-windows-msvc)..."
 Invoke-Download "https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe" "$env:TEMP\rustup-init.exe"
 & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --default-host aarch64-pc-windows-msvc
 Update-Path
 rustup component add clippy rustfmt
 Write-Host "  Rust installed: $(rustc --version)"
 
-# -- 4. Git for Windows (ARM64, silent) --
-Write-Host "[6/8] Installing Git for Windows (ARM64)..."
+# -- 4. uv + Python (uv-managed CPython, native ARM64) --
+# uv ships an aarch64-pc-windows-msvc build, and uv itself provisions the Python
+# toolchain (python-build-standalone, which has native win-arm64 builds) -- so we
+# get both the package/venv manager AND Python without a python.org ARM64 MSI.
+# Use `uv venv` (the uv equivalent of `python -m venv`) / `uv run` for envs.
+Write-Host "[6/9] Installing uv + Python (aarch64)..."
+$uvRel = Invoke-RestMethod -Uri "https://api.github.com/repos/astral-sh/uv/releases/latest" -Headers $GhHeaders -UseBasicParsing
+$uvAsset = $uvRel.assets | Where-Object { $_.name -eq 'uv-aarch64-pc-windows-msvc.zip' } | Select-Object -First 1
+if (-not $uvAsset) { throw "No aarch64 uv asset found in the latest uv release." }
+$uvZip = "$env:TEMP\uv-arm64.zip"
+Invoke-Download $uvAsset.browser_download_url $uvZip
+$uvDest = "C:\Program Files\uv"
+New-Item -ItemType Directory -Force -Path $uvDest | Out-Null
+Expand-Archive -Path $uvZip -DestinationPath $uvDest -Force
+Add-MachinePath $uvDest
+Assert-CommandAvailable -Name "uv" | Out-Null
+Write-Host "  uv installed: $(uv --version)"
+# Provision a managed CPython. `--default` also drops `python`/`python3` shims on
+# PATH so a bare `python` resolves, not just `uv run python`.
+uv python install 3.13 --default
+Update-Path
+Write-Host "  Python (uv-managed): $(uv run --python 3.13 python --version)"
+
+# -- 5. Git for Windows (ARM64, silent) --
+Write-Host "[7/9] Installing Git for Windows (ARM64)..."
 try {
     $gitRel = Invoke-RestMethod -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" -Headers $GhHeaders -UseBasicParsing
     $gitAsset = $gitRel.assets | Where-Object { $_.name -match '^Git-.*-arm64\.exe$' } | Select-Object -First 1
@@ -194,8 +217,8 @@ try {
     Write-Warning "  Git install failed: $($_.Exception.Message)"
 }
 
-# -- 5. GitHub CLI (ARM64 MSI, non-fatal) --
-Write-Host "[7/8] Installing GitHub CLI (ARM64)..."
+# -- 6. GitHub CLI (ARM64 MSI, non-fatal) --
+Write-Host "[8/9] Installing GitHub CLI (ARM64)..."
 try {
     $ghRel = Invoke-RestMethod -Uri "https://api.github.com/repos/cli/cli/releases/latest" -Headers $GhHeaders -UseBasicParsing
     $ghAsset = $ghRel.assets | Where-Object { $_.name -match 'windows_arm64\.msi$' } | Select-Object -First 1
@@ -212,8 +235,8 @@ try {
     Write-Warning "  GitHub CLI install failed: $($_.Exception.Message)"
 }
 
-# -- 6. Claude Code + Codex CLI (npm global) --
-Write-Host "[8/8] Installing Claude Code + Codex CLI..."
+# -- 7. Claude Code + Codex CLI (npm global) --
+Write-Host "[9/9] Installing Claude Code + Codex CLI..."
 & "$nodeDest\npm.cmd" install -g @anthropic-ai/claude-code
 Update-Path
 Write-Host "  Claude Code installed: $(claude --version)"
@@ -225,7 +248,7 @@ try { Write-Host "  Codex CLI installed: $(codex --version)" } catch { Write-War
 New-Item -ItemType Directory -Force -Path "C:\workspace" | Out-Null
 
 # -- Optional: re-arm automatic Windows Update --
-# [2/8] turned automatic updates off so nothing could reboot the guest while
+# [2/9] turned automatic updates off so nothing could reboot the guest while
 # this script runs. Default is to LEAVE them off (deterministic snapshot
 # restores; no surprise restarts mid agent session). `Start-Provision.sh
 # --rearm-updates` re-arms them here -- last, now that the reboot-sensitive

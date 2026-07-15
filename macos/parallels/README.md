@@ -104,15 +104,16 @@ Once Parallels Tools is up, `prlctl exec` becomes the host→guest control
 channel. `Start-Provision.sh` uses it only to launch the provisioner as a
 non-interactive batch scheduled task (see the caveat below), which installs the
 toolchain: VS Build Tools with native ARM64 compilers, `aarch64-pc-windows-msvc`
-Rust, Node, Git, gh, Claude Code, and Codex.
+Rust, Node, `uv` with a uv-managed native ARM64 Python, Git, gh, Claude Code, and
+Codex.
 
 ## Notes / operational caveats
 
 This workflow has been run **end-to-end on Parallels Desktop 26.4** with a
 Windows 11 ARM64 guest: UUP-dump ISO build → unattended install → Parallels Tools
 → toolchain provision → `CleanProvisionedBase` snapshot, with `node`, `npm`,
-`rustc`, `cargo`, `git`, `claude`, and the native ARM64 `cl.exe` all resolving
-in-guest afterward. A few operational notes still apply:
+`rustc`, `cargo`, `uv`, `python`, `git`, `claude`, and the native ARM64 `cl.exe`
+all resolving in-guest afterward. A few operational notes still apply:
 
 - **Boot prompt.** If the VM stalls at "Press any key to boot from CD or DVD",
   click the window and press a key once (only the first boot). A promptless boot
