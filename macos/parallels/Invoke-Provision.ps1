@@ -183,11 +183,22 @@ Expand-Archive -Path $uvZip -DestinationPath $uvDest -Force
 Add-MachinePath $uvDest
 Assert-CommandAvailable -Name "uv" | Out-Null
 Write-Host "  uv installed: $(uv --version)"
-# Provision a managed CPython. `--default` also drops `python`/`python3` shims on
-# PATH so a bare `python` resolves, not just `uv run python`.
+# Provision a managed CPython. `--default` drops `python`/`python3` shims into
+# uv's Python *bin* directory (NOT $uvDest) -- by default %USERPROFILE%\.local\bin
+# -- so pin it via UV_PYTHON_BIN_DIR to a known location and put THAT on the
+# machine PATH, otherwise later sessions resolve `uv` but not a bare `python`.
+$uvPythonBin = Join-Path $uvDest "python-bin"
+New-Item -ItemType Directory -Force -Path $uvPythonBin | Out-Null
+[System.Environment]::SetEnvironmentVariable("UV_PYTHON_BIN_DIR", $uvPythonBin, "Machine")
+$env:UV_PYTHON_BIN_DIR = $uvPythonBin
 uv python install 3.13 --default
+if ($LASTEXITCODE -ne 0) { throw "uv failed to install a managed Python (exit $LASTEXITCODE)." }
+Add-MachinePath $uvPythonBin
 Update-Path
-Write-Host "  Python (uv-managed): $(uv run --python 3.13 python --version)"
+# Fail hard if the global `python` shim did not actually land on PATH, so the
+# README's promise that `python` resolves in-guest is enforced here.
+Assert-CommandAvailable -Name "python" -InstallHint "uv --default installs the python shim into UV_PYTHON_BIN_DIR ($uvPythonBin); ensure that dir is on PATH." | Out-Null
+Write-Host "  Python (uv-managed): $(python --version)"
 
 # -- 5. Git for Windows (ARM64, silent) --
 Write-Host "[7/9] Installing Git for Windows (ARM64)..."
