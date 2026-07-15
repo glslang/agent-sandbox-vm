@@ -141,6 +141,8 @@ Credentials are stored per VM as encrypted `vm-cred.xml` files (only readable by
 - VS Build Tools 2026 with `VCTools` workload + Windows 11 SDK 26100 + CMake
 - Rust stable (`x86_64-pc-windows-msvc`) with clippy and rustfmt
 - Node.js (latest via winget)
+- Python 3.13 (`Python.Python.3.13` via winget)
+- uv (`astral-sh.uv` via winget) — Python package/venv manager (`uv venv`, `uv run`)
 - GitHub CLI (`gh` via winget)
 - TTD command line utility (`Microsoft.TimeTravelDebugging` via winget)
 - Claude Code (`@anthropic-ai/claude-code`) authenticated via OAuth

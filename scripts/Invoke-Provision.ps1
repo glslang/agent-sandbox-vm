@@ -113,7 +113,7 @@ function Assert-CommandAvailable {
 # -- 0. Execution Policy --
 # Set machine-wide policy so npm-installed .ps1 wrappers (e.g. claude.ps1) run
 # in all future sessions without needing a per-process policy override each time.
-Write-Host "[1/14] Setting execution policy..."
+Write-Host "[1/16] Setting execution policy..."
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
 Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 
@@ -121,7 +121,7 @@ Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 # Install the modern cross-platform PowerShell (pwsh). Windows ships only with
 # Windows PowerShell 5.1; pwsh is the preferred shell for agent tooling and is
 # the host targeted by the Oh My Posh profile init configured below.
-Write-Host "[2/14] Installing PowerShell 7..."
+Write-Host "[2/16] Installing PowerShell 7..."
 
 # This is the first winget call on the provisioning path, so make sure WinGet has
 # finished registering before relying on it.
@@ -131,7 +131,7 @@ $pwshCommand = Assert-CommandAvailable -Name "pwsh.exe" -InstallHint "PowerShell
 Write-Host "  PowerShell 7 installed: $(pwsh --version)"
 
 # -- 2. VS Build Tools --
-Write-Host "[3/14] Installing VS Build Tools..."
+Write-Host "[3/16] Installing VS Build Tools..."
 
 $layoutInstaller = "C:\vs-cache\layout\vs_buildtools.exe"
 $onlineInstaller = "$env:TEMP\vs_buildtools.exe"
@@ -163,7 +163,7 @@ if ($proc.ExitCode -notin 0, 3010) {
 }
 
 # -- 3. Rust (MSVC toolchain) --
-Write-Host "[4/14] Installing Rust..."
+Write-Host "[4/16] Installing Rust..."
 
 Invoke-WebRequest "https://win.rustup.rs/x86_64" -OutFile "$env:TEMP\rustup-init.exe"
 & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
@@ -172,15 +172,46 @@ rustup component add clippy rustfmt
 Write-Host "  Rust installed: $(rustc --version)"
 
 # -- 4. Node.js --
-Write-Host "[5/14] Installing Node.js..."
+Write-Host "[5/16] Installing Node.js..."
 
 Install-WingetPackage -Id "OpenJS.NodeJS" -DisplayName "Node.js"
 Assert-CommandAvailable -Name "node" -InstallHint "If Node was installed by winget, open a new elevated PowerShell session or verify C:\Program Files\nodejs is on PATH." | Out-Null
 Assert-CommandAvailable -Name "npm" -InstallHint "npm should be installed with Node.js." | Out-Null
 Write-Host "  Node installed: $(node --version)"
 
-# -- 5. Git for Windows (Git Bash) --
-Write-Host "[6/14] Installing Git for Windows..."
+# -- 5. Python --
+# Install CPython system-wide. The winget package puts python.exe and its
+# Scripts\ dir on PATH, giving the agent a stock `python`/`pip` plus the
+# built-in `python -m venv` for virtual environments.
+Write-Host "[6/16] Installing Python..."
+
+Install-WingetPackage -Id "Python.Python.3.13" -DisplayName "Python 3.13"
+Assert-CommandAvailable -Name "python" -InstallHint "Python should be installed by winget; verify the install dir and its Scripts folder are on PATH." | Out-Null
+Write-Host "  Python installed: $(python --version)"
+
+# -- 6. uv (Python package + venv manager) --
+# uv is the fast, modern alternative to pip/virtualenv. It provides `uv venv`
+# (the uv equivalent of `python -m venv`) and `uv run` for managed environments.
+Write-Host "[7/16] Installing uv..."
+
+Install-WingetPackage -Id "astral-sh.uv" -DisplayName "uv"
+Assert-CommandAvailable -Name "uv" -InstallHint "uv should be installed by winget." | Out-Null
+Write-Host "  uv installed: $(uv --version)"
+
+# Verify end to end that a virtual environment can actually be created, so a
+# broken Python/uv install fails here rather than in the agent's first session.
+$uvVenvProbe = Join-Path $env:TEMP "uv-venv-probe"
+Remove-Item $uvVenvProbe -Recurse -Force -ErrorAction SilentlyContinue
+uv venv $uvVenvProbe | Out-Null
+if (Test-Path (Join-Path $uvVenvProbe "Scripts\python.exe")) {
+    Write-Host "  Verified: 'uv venv' creates a working virtual environment."
+} else {
+    Write-Warning "  'uv venv' did not produce the expected environment layout."
+}
+Remove-Item $uvVenvProbe -Recurse -Force -ErrorAction SilentlyContinue
+
+# -- 7. Git for Windows (Git Bash) --
+Write-Host "[8/16] Installing Git for Windows..."
 
 Install-WingetPackage -Id "Git.Git" -DisplayName "Git for Windows"
 Refresh-Path
@@ -202,21 +233,21 @@ if ($gitBashExe) {
     Write-Warning "  bash.exe not found in expected locations -- set CLAUDE_CODE_GIT_BASH_PATH manually."
 }
 
-# -- 6. GitHub CLI --
-Write-Host "[7/14] Installing GitHub CLI..."
+# -- 8. GitHub CLI --
+Write-Host "[9/16] Installing GitHub CLI..."
 
 Install-WingetPackage -Id "GitHub.cli" -DisplayName "GitHub CLI"
 Assert-CommandAvailable -Name "gh" -InstallHint "GitHub CLI should be installed by winget." | Out-Null
 Write-Host "  GitHub CLI installed: $(gh --version | Select-Object -First 1)"
 
-# -- 7. Windows Terminal --
-Write-Host "[8/14] Installing Windows Terminal..."
+# -- 9. Windows Terminal --
+Write-Host "[10/16] Installing Windows Terminal..."
 
 Install-WingetPackage -Id "Microsoft.WindowsTerminal" -DisplayName "Windows Terminal"
 Write-Host "  Windows Terminal installed."
 
-# -- 8. Oh My Posh --
-Write-Host "[9/14] Installing Oh My Posh..."
+# -- 10. Oh My Posh --
+Write-Host "[11/16] Installing Oh My Posh..."
 
 Install-WingetPackage -Id "JanDeDobbeleer.OhMyPosh" -DisplayName "Oh My Posh"
 Assert-CommandAvailable -Name "oh-my-posh" -InstallHint "Oh My Posh should be installed by winget." | Out-Null
@@ -247,29 +278,29 @@ Write-Host "  Oh My Posh installed (theme: jandedobbeleer, font: CascadiaCode NF
 Write-Host "  Configured profiles: $($profileTargets -join ', ')"
 Write-Host "  Themes directory: `$env:POSH_THEMES_PATH -- swap theme by editing your profile."
 
-# -- 9. TTD command line utility --
-Write-Host "[10/14] Installing TTD command line utility..."
+# -- 11. TTD command line utility --
+Write-Host "[12/16] Installing TTD command line utility..."
 
 Install-WingetPackage -Id "Microsoft.TimeTravelDebugging" -DisplayName "TTD command line utility"
 $ttdCommand = Assert-CommandAvailable -Name "ttd.exe" -InstallHint "TTD should be installed by winget."
 Write-Host "  TTD installed: $($ttdCommand.Source)"
 
-# -- 10. Claude Code --
-Write-Host "[11/14] Installing Claude Code..."
+# -- 12. Claude Code --
+Write-Host "[13/16] Installing Claude Code..."
 
 npm install -g @anthropic-ai/claude-code
 Refresh-Path
 Write-Host "  Claude Code installed: $(claude --version)"
 
-# -- 11. OpenAI Codex CLI --
-Write-Host "[12/14] Installing OpenAI Codex CLI..."
+# -- 13. OpenAI Codex CLI --
+Write-Host "[14/16] Installing OpenAI Codex CLI..."
 
 npm install -g @openai/codex
 Refresh-Path
 Write-Host "  Codex CLI installed: $(codex --version)"
 
-# -- 12. Authenticate --
-Write-Host "[13/14] Authenticating with Claude (optional)..."
+# -- 14. Authenticate --
+Write-Host "[15/16] Authenticating with Claude (optional)..."
 Write-Host "  Skip this step if you are using OpenAI Codex CLI only."
 Write-Host ""
 $reply = Read-Host "  Authenticate with Claude now? [Y/n]"
@@ -281,8 +312,8 @@ if ($reply -eq '' -or $reply -match '^[Yy]') {
     Write-Host "  Skipped. Run 'claude login' inside the VM whenever you need it."
 }
 
-# -- 13. Enable PSRemoting (for artifact extraction from host) --
-Write-Host "[14/14] Enabling PowerShell remoting..."
+# -- 15. Enable PSRemoting (for artifact extraction from host) --
+Write-Host "[16/16] Enabling PowerShell remoting..."
 
 Enable-PSRemoting -Force -SkipNetworkProfileCheck
 Set-Service WinRM -StartupType Automatic

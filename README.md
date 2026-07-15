@@ -64,7 +64,7 @@ Then **inside the VM**, run:
 powershell -ExecutionPolicy RemoteSigned -File C:\Invoke-Provision.ps1
 ```
 
-This installs PowerShell 7 (`pwsh`), VS Build Tools, Rust (MSVC), Node.js, Git, GitHub CLI (`gh`), Windows Terminal, Oh My Posh (with CascadiaCode Nerd Font), TTD command line utility, Claude Code, and OpenAI Codex CLI. It then prompts you to authenticate with Claude via OAuth — skip this if you only need Codex CLI.
+This installs PowerShell 7 (`pwsh`), VS Build Tools, Rust (MSVC), Node.js, Python (with the `uv` package/venv manager), Git, GitHub CLI (`gh`), Windows Terminal, Oh My Posh (with CascadiaCode Nerd Font), TTD command line utility, Claude Code, and OpenAI Codex CLI. It then prompts you to authenticate with Claude via OAuth — skip this if you only need Codex CLI.
 
 ### Step 4 -- Snapshot
 
