@@ -14,6 +14,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify VERSION matches tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          if [ "v$file_version" != "$TAG" ]; then
+            echo "VERSION file ($file_version) does not match release tag ($TAG)." >&2
+            echo "Update VERSION and re-tag before releasing." >&2
+            exit 1
+          fi
+
       - name: Create release zip
         run: |
           zip -r agent-sandbox-vm-${{ github.ref_name }}.zip \
@@ -26,7 +37,8 @@ jobs:
             AGENTS.md \
             CLAUDE.md \
             LICENSE \
-            README.md
+            README.md \
+            VERSION
 
       - name: Create GitHub Release
         env:
