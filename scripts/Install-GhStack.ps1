@@ -88,10 +88,15 @@ if ($SkipExtension) {
 # so it applies to every project synced into C:\workspace and is captured by the
 # base snapshot, rather than living in one project's working copy.
 #
-# This half is reported through the exit code rather than a throw, because the
-# usual reason it does not run -- an unauthenticated `gh` on a fresh VM -- is
-# expected, not a failure. Callers get: 0 = everything installed, 2 = extension
-# installed but the skill still needs a pass. Anything else is a real error.
+# Exit contract:
+#   0 -- extension and skill are both in place
+#   2 -- extension is in, but the skill is pending ONLY because `gh` is not
+#        authenticated. That is the expected state on a fresh VM, not a failure,
+#        and its remedy is specifically `gh auth login`, so it gets its own code
+#        rather than a throw.
+#   throw (1) -- anything else, including a `gh` too old for `gh skill` and a
+#        skill install that failed while authenticated. Those are real errors
+#        with different remedies, so they must not masquerade as "needs auth".
 $skillPendingExit = 2
 
 if ($SkipSkill) {
@@ -102,9 +107,8 @@ if ($SkipSkill) {
 Write-Host "Installing the gh-stack agent skill..."
 
 if (-not (Test-GhSubcommand -Name "skill")) {
-    Write-Warning ("  This GitHub CLI has no 'gh skill' command (it is a recent addition). " +
-                   "Upgrade gh (winget upgrade --id GitHub.cli) and re-run this script.")
-    exit $skillPendingExit
+    throw ("This GitHub CLI has no 'gh skill' command (it is a recent addition). " +
+           "Upgrade gh (winget upgrade --id GitHub.cli) and re-run this script.")
 }
 
 # `gh skill install <owner>/<repo>` resolves the skill through the GitHub API and
@@ -130,9 +134,11 @@ foreach ($agent in $SkillAgents) {
     }
 }
 
+# `gh` was authenticated, so a failure here is a genuine error -- not the
+# pending-auth case -- and telling the caller to run `gh auth login` would send
+# them down the wrong path.
 if ($failedAgents.Count -gt 0) {
-    Write-Warning "  gh-stack skill missing for: $($failedAgents -join ', ')."
-    exit $skillPendingExit
+    throw "'gh skill install' failed for: $($failedAgents -join ', '). See the errors above."
 }
 
 exit 0

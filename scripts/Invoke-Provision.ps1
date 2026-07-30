@@ -261,31 +261,44 @@ $ghStackScript = @(
     "C:\Install-GhStack.ps1"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-$ghStackRetry = "powershell -ExecutionPolicy RemoteSigned -File C:\Install-GhStack.ps1"
+# Each outcome carries its own remedy: pointing every failure at `gh auth login`
+# would send users down the wrong path when the cause was something else, and a
+# missing installer cannot be fixed from inside the VM at all.
+$ghStackInstaller = "powershell -ExecutionPolicy RemoteSigned -File C:\Install-GhStack.ps1"
 $ghStackWarning = ""
+$ghStackRemedy = @()
 
 if (-not $ghStackScript) {
-    $ghStackWarning = "Install-GhStack.ps1 was not found next to this script or at C:\ -- " +
-                      "re-run Start-Provision.ps1 on the host to copy it in."
-    Write-Warning "  $ghStackWarning"
+    $ghStackWarning = "Install-GhStack.ps1 was not found next to this script or at C:\."
+    # Nothing in the VM can fix this -- the file has to be copied in from the host.
+    $ghStackRemedy = @("On the HOST: .\scripts\Start-Provision.ps1 -VMName <this-vm-name>")
 } else {
     try {
         & $ghStackScript
-        # Exit code 2 means the extension is in but the skill is not -- almost
-        # always because `gh` is not authenticated yet on a fresh VM.
-        if ($LASTEXITCODE -eq 2) {
-            $ghStackWarning = "the gh-stack agent skill is not installed yet ('gh skill install' " +
-                              "needs an authenticated gh)."
-            $ghStackRetry = "gh auth login; $ghStackRetry -SkipExtension"
+        switch ($LASTEXITCODE) {
+            0 { }
+            # Documented in Install-GhStack.ps1: extension in, skill pending
+            # only because `gh` is unauthenticated -- the fresh-VM norm.
+            2 {
+                $ghStackWarning = "the gh-stack agent skill is not installed yet ('gh skill install' " +
+                                  "needs an authenticated gh)."
+                $ghStackRemedy = @("gh auth login", "$ghStackInstaller -SkipExtension")
+            }
+            default {
+                $ghStackWarning = "Install-GhStack.ps1 exited with code $LASTEXITCODE."
+                $ghStackRemedy = @($ghStackInstaller)
+            }
         }
     } catch {
         $ghStackWarning = "gh-stack was not fully installed: $($_.Exception.Message)"
-        Write-Warning "  $ghStackWarning"
+        $ghStackRemedy = @($ghStackInstaller)
     }
+}
 
-    if ($ghStackWarning) {
-        Write-Warning "  Retry inside the VM with: $ghStackRetry"
-    }
+# Surface the problem where it happens; the remedy is printed once, by the
+# final banner, so it lands last and is not buried by the remaining steps.
+if ($ghStackWarning) {
+    Write-Warning "  $ghStackWarning"
 }
 
 # -- 10. Windows Terminal --
@@ -375,8 +388,9 @@ Write-Host "----------------------------------------------"
 Write-Host "  Provisioning complete!"
 Write-Host ""
 if ($ghStackWarning) {
-    Write-Host "  gh-stack needs another pass -- run this before snapshotting:"
-    Write-Host "    $ghStackRetry"
+    Write-Host "  gh-stack needs another pass ($ghStackWarning)"
+    Write-Host "  Run this before snapshotting:"
+    foreach ($line in $ghStackRemedy) { Write-Host "    $line" }
     Write-Host ""
 }
 Write-Host "  Shut down this VM now, then on your HOST:"

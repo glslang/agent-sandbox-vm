@@ -114,7 +114,7 @@ codex    # OpenAI Codex CLI
 
 ### Stacked pull requests
 
-The VM ships [GitHub Stacked PRs](https://github.github.com/gh-stack/) — the `gh stack` extension, which breaks a large change into a chain of small PRs that each build on the one below it — plus the gh-stack agent skill, so Claude Code and Codex know how to drive it.
+The VM ships [GitHub Stacked PRs](https://github.github.com/gh-stack/) — the `gh stack` extension, which breaks a large change into a chain of small PRs that each build on the one below it. Provisioning also *tries* to install the gh-stack agent skill, so Claude Code and Codex know how to drive it, but that half needs an authenticated `gh` and so usually stays pending on a fresh VM until you finish it with the [recovery step](#if-the-skill-is-still-pending) below.
 
 ```powershell
 gh stack init              # start a stack (first branch targets the trunk)
@@ -130,6 +130,8 @@ gh stack sync              # fetch, cascade-rebase, and push in one step
 ```powershell
 gh auth login
 ```
+
+#### If the skill is still pending
 
 If provisioning warned that the gh-stack skill was skipped (it needs an authenticated `gh`), install it after logging in and then re-take the base snapshot so it persists:
 
