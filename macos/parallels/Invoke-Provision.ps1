@@ -257,6 +257,12 @@ try {
 # half needs an authenticated gh that a fresh guest does not have.
 Write-Host "[9/10] Installing GitHub Stacked PRs (gh stack)..."
 Update-Path
+
+# The guest ships both agents, so the skill goes in for both. One list drives
+# the install loop AND the retry hint printed when gh is unauthenticated, so the
+# printed commands can never cover fewer agents than the loop would have.
+$ghStackAgents = @("claude-code", "codex")
+
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Warning "  gh is not on PATH; skipping gh-stack."
 } else {
@@ -280,9 +286,11 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
         } elseif (-not $isAuthed) {
             Write-Warning "  gh is not authenticated; skipping the gh-stack skill. Later, run:"
             Write-Warning "      gh auth login"
-            Write-Warning "      gh skill install github/gh-stack --agent claude-code --scope user --all --force"
+            foreach ($agent in $ghStackAgents) {
+                Write-Warning "      gh skill install github/gh-stack --agent $agent --scope user --all --force"
+            }
         } else {
-            foreach ($agent in @("claude-code", "codex")) {
+            foreach ($agent in $ghStackAgents) {
                 gh skill install github/gh-stack --agent $agent --scope user --all --force
                 if ($LASTEXITCODE -ne 0) {
                     Write-Warning "  gh-stack skill install failed for '$agent' (exit $LASTEXITCODE)."

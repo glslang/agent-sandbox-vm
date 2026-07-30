@@ -149,10 +149,17 @@ all resolving in-guest afterward. A few operational notes still apply:
   [GitHub Stacked PRs](https://github.github.com/gh-stack/) step never fails the
   run: the extension needs a `windows/arm64` release asset from `github/gh-stack`,
   and the accompanying agent skill is fetched through the GitHub API, so it is
-  skipped on a guest where `gh` is not authenticated. Finish it in-guest and
-  re-run `Save-BaseSnapshot.sh` so it survives restores:
-  `gh auth login` then
-  `gh skill install github/gh-stack --agent claude-code --scope user --all --force`.
+  skipped on a guest where `gh` is not authenticated. Finish it in-guest — once
+  per agent, since the guest ships both — and re-run `Save-BaseSnapshot.sh` so it
+  survives restores:
+
+  ```powershell
+  gh auth login
+  gh skill install github/gh-stack --agent claude-code --scope user --all --force
+  gh skill install github/gh-stack --agent codex --scope user --all --force
+  ```
+
+  The provisioner prints the same commands when it skips this step.
 - **Shared-folder path.** Scripts assume the guest mount is `\\Mac\workspace`
   (override `GuestShareUNC` in `config.json` if your Parallels build differs).
 - **Provisioning runs as a non-interactive (batch) scheduled task — no login
