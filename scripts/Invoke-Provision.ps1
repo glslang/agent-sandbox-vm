@@ -6,6 +6,8 @@
 #   - Internet access (Default Switch must be active)
 #   - VS Build Tools layout at C:\vs-cache\layout (copied in by Start-Provision.ps1)
 #     OR falls back to downloading from internet
+#   - Install-GhStack.ps1 alongside this script or at C:\ (copied in by
+#     Start-Provision.ps1); the gh-stack step is skipped with a warning without it
 
 #Requires -RunAsAdministrator
 
@@ -113,7 +115,7 @@ function Assert-CommandAvailable {
 # -- 0. Execution Policy --
 # Set machine-wide policy so npm-installed .ps1 wrappers (e.g. claude.ps1) run
 # in all future sessions without needing a per-process policy override each time.
-Write-Host "[1/16] Setting execution policy..."
+Write-Host "[1/17] Setting execution policy..."
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
 Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 
@@ -121,7 +123,7 @@ Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 # Install the modern cross-platform PowerShell (pwsh). Windows ships only with
 # Windows PowerShell 5.1; pwsh is the preferred shell for agent tooling and is
 # the host targeted by the Oh My Posh profile init configured below.
-Write-Host "[2/16] Installing PowerShell 7..."
+Write-Host "[2/17] Installing PowerShell 7..."
 
 # This is the first winget call on the provisioning path, so make sure WinGet has
 # finished registering before relying on it.
@@ -131,7 +133,7 @@ $pwshCommand = Assert-CommandAvailable -Name "pwsh.exe" -InstallHint "PowerShell
 Write-Host "  PowerShell 7 installed: $(pwsh --version)"
 
 # -- 2. VS Build Tools --
-Write-Host "[3/16] Installing VS Build Tools..."
+Write-Host "[3/17] Installing VS Build Tools..."
 
 $layoutInstaller = "C:\vs-cache\layout\vs_buildtools.exe"
 $onlineInstaller = "$env:TEMP\vs_buildtools.exe"
@@ -163,7 +165,7 @@ if ($proc.ExitCode -notin 0, 3010) {
 }
 
 # -- 3. Rust (MSVC toolchain) --
-Write-Host "[4/16] Installing Rust..."
+Write-Host "[4/17] Installing Rust..."
 
 Invoke-WebRequest "https://win.rustup.rs/x86_64" -OutFile "$env:TEMP\rustup-init.exe"
 & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
@@ -172,7 +174,7 @@ rustup component add clippy rustfmt
 Write-Host "  Rust installed: $(rustc --version)"
 
 # -- 4. Node.js --
-Write-Host "[5/16] Installing Node.js..."
+Write-Host "[5/17] Installing Node.js..."
 
 Install-WingetPackage -Id "OpenJS.NodeJS" -DisplayName "Node.js"
 Assert-CommandAvailable -Name "node" -InstallHint "If Node was installed by winget, open a new elevated PowerShell session or verify C:\Program Files\nodejs is on PATH." | Out-Null
@@ -183,7 +185,7 @@ Write-Host "  Node installed: $(node --version)"
 # Install CPython system-wide. The winget package puts python.exe and its
 # Scripts\ dir on PATH, giving the agent a stock `python`/`pip` plus the
 # built-in `python -m venv` for virtual environments.
-Write-Host "[6/16] Installing Python..."
+Write-Host "[6/17] Installing Python..."
 
 Install-WingetPackage -Id "Python.Python.3.13" -DisplayName "Python 3.13"
 Assert-CommandAvailable -Name "python" -InstallHint "Python should be installed by winget; verify the install dir and its Scripts folder are on PATH." | Out-Null
@@ -192,7 +194,7 @@ Write-Host "  Python installed: $(python --version)"
 # -- 6. uv (Python package + venv manager) --
 # uv is the fast, modern alternative to pip/virtualenv. It provides `uv venv`
 # (the uv equivalent of `python -m venv`) and `uv run` for managed environments.
-Write-Host "[7/16] Installing uv..."
+Write-Host "[7/17] Installing uv..."
 
 Install-WingetPackage -Id "astral-sh.uv" -DisplayName "uv"
 Assert-CommandAvailable -Name "uv" -InstallHint "uv should be installed by winget." | Out-Null
@@ -215,7 +217,7 @@ if (-not $uvVenvOk) {
 Write-Host "  Verified: 'uv venv' creates a working virtual environment."
 
 # -- 7. Git for Windows (Git Bash) --
-Write-Host "[8/16] Installing Git for Windows..."
+Write-Host "[8/17] Installing Git for Windows..."
 
 Install-WingetPackage -Id "Git.Git" -DisplayName "Git for Windows"
 Refresh-Path
@@ -238,20 +240,62 @@ if ($gitBashExe) {
 }
 
 # -- 8. GitHub CLI --
-Write-Host "[9/16] Installing GitHub CLI..."
+Write-Host "[9/17] Installing GitHub CLI..."
 
 Install-WingetPackage -Id "GitHub.cli" -DisplayName "GitHub CLI"
 Assert-CommandAvailable -Name "gh" -InstallHint "GitHub CLI should be installed by winget." | Out-Null
 Write-Host "  GitHub CLI installed: $(gh --version | Select-Object -First 1)"
 
-# -- 9. Windows Terminal --
-Write-Host "[10/16] Installing Windows Terminal..."
+# -- 9. GitHub Stacked PRs (gh stack) --
+# https://github.github.com/gh-stack/ -- the `gh stack` extension plus the agent
+# skill that teaches Claude Code and Codex how to drive it.
+#
+# Best-effort: the skill half needs an authenticated `gh`, which a fresh VM does
+# not have, and neither half is worth aborting a provisioning run that has
+# already installed the compiler toolchain. Install-GhStack.ps1 is idempotent,
+# so the retry printed below (and in the final banner) just works.
+Write-Host "[10/17] Installing GitHub Stacked PRs (gh stack)..."
+
+$ghStackScript = @(
+    (Join-Path $PSScriptRoot "Install-GhStack.ps1"),
+    "C:\Install-GhStack.ps1"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+$ghStackRetry = "powershell -ExecutionPolicy RemoteSigned -File C:\Install-GhStack.ps1"
+$ghStackWarning = ""
+
+if (-not $ghStackScript) {
+    $ghStackWarning = "Install-GhStack.ps1 was not found next to this script or at C:\ -- " +
+                      "re-run Start-Provision.ps1 on the host to copy it in."
+    Write-Warning "  $ghStackWarning"
+} else {
+    try {
+        & $ghStackScript
+        # Exit code 2 means the extension is in but the skill is not -- almost
+        # always because `gh` is not authenticated yet on a fresh VM.
+        if ($LASTEXITCODE -eq 2) {
+            $ghStackWarning = "the gh-stack agent skill is not installed yet ('gh skill install' " +
+                              "needs an authenticated gh)."
+            $ghStackRetry = "gh auth login; $ghStackRetry -SkipExtension"
+        }
+    } catch {
+        $ghStackWarning = "gh-stack was not fully installed: $($_.Exception.Message)"
+        Write-Warning "  $ghStackWarning"
+    }
+
+    if ($ghStackWarning) {
+        Write-Warning "  Retry inside the VM with: $ghStackRetry"
+    }
+}
+
+# -- 10. Windows Terminal --
+Write-Host "[11/17] Installing Windows Terminal..."
 
 Install-WingetPackage -Id "Microsoft.WindowsTerminal" -DisplayName "Windows Terminal"
 Write-Host "  Windows Terminal installed."
 
-# -- 10. Oh My Posh --
-Write-Host "[11/16] Installing Oh My Posh..."
+# -- 11. Oh My Posh --
+Write-Host "[12/17] Installing Oh My Posh..."
 
 Install-WingetPackage -Id "JanDeDobbeleer.OhMyPosh" -DisplayName "Oh My Posh"
 Assert-CommandAvailable -Name "oh-my-posh" -InstallHint "Oh My Posh should be installed by winget." | Out-Null
@@ -282,29 +326,29 @@ Write-Host "  Oh My Posh installed (theme: jandedobbeleer, font: CascadiaCode NF
 Write-Host "  Configured profiles: $($profileTargets -join ', ')"
 Write-Host "  Themes directory: `$env:POSH_THEMES_PATH -- swap theme by editing your profile."
 
-# -- 11. TTD command line utility --
-Write-Host "[12/16] Installing TTD command line utility..."
+# -- 12. TTD command line utility --
+Write-Host "[13/17] Installing TTD command line utility..."
 
 Install-WingetPackage -Id "Microsoft.TimeTravelDebugging" -DisplayName "TTD command line utility"
 $ttdCommand = Assert-CommandAvailable -Name "ttd.exe" -InstallHint "TTD should be installed by winget."
 Write-Host "  TTD installed: $($ttdCommand.Source)"
 
-# -- 12. Claude Code --
-Write-Host "[13/16] Installing Claude Code..."
+# -- 13. Claude Code --
+Write-Host "[14/17] Installing Claude Code..."
 
 npm install -g @anthropic-ai/claude-code
 Refresh-Path
 Write-Host "  Claude Code installed: $(claude --version)"
 
-# -- 13. OpenAI Codex CLI --
-Write-Host "[14/16] Installing OpenAI Codex CLI..."
+# -- 14. OpenAI Codex CLI --
+Write-Host "[15/17] Installing OpenAI Codex CLI..."
 
 npm install -g @openai/codex
 Refresh-Path
 Write-Host "  Codex CLI installed: $(codex --version)"
 
-# -- 14. Authenticate --
-Write-Host "[15/16] Authenticating with Claude (optional)..."
+# -- 15. Authenticate --
+Write-Host "[16/17] Authenticating with Claude (optional)..."
 Write-Host "  Skip this step if you are using OpenAI Codex CLI only."
 Write-Host ""
 $reply = Read-Host "  Authenticate with Claude now? [Y/n]"
@@ -316,8 +360,8 @@ if ($reply -eq '' -or $reply -match '^[Yy]') {
     Write-Host "  Skipped. Run 'claude login' inside the VM whenever you need it."
 }
 
-# -- 15. Enable PSRemoting (for artifact extraction from host) --
-Write-Host "[16/16] Enabling PowerShell remoting..."
+# -- 16. Enable PSRemoting (for artifact extraction from host) --
+Write-Host "[17/17] Enabling PowerShell remoting..."
 
 Enable-PSRemoting -Force -SkipNetworkProfileCheck
 Set-Service WinRM -StartupType Automatic
@@ -330,6 +374,11 @@ Write-Host ""
 Write-Host "----------------------------------------------"
 Write-Host "  Provisioning complete!"
 Write-Host ""
+if ($ghStackWarning) {
+    Write-Host "  gh-stack needs another pass -- run this before snapshotting:"
+    Write-Host "    $ghStackRetry"
+    Write-Host ""
+}
 Write-Host "  Shut down this VM now, then on your HOST:"
 Write-Host "    .\scripts\Save-BaseSnapshot.ps1 -VMName <this-vm-name>"
 Write-Host "----------------------------------------------"

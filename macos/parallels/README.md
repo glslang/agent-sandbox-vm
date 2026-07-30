@@ -104,8 +104,9 @@ Once Parallels Tools is up, `prlctl exec` becomes the host→guest control
 channel. `Start-Provision.sh` uses it only to launch the provisioner as a
 non-interactive batch scheduled task (see the caveat below), which installs the
 toolchain: VS Build Tools with native ARM64 compilers, `aarch64-pc-windows-msvc`
-Rust, Node, `uv` with a uv-managed native ARM64 Python, Git, gh, Claude Code, and
-Codex.
+Rust, Node, `uv` with a uv-managed native ARM64 Python, Git, gh,
+[GitHub Stacked PRs](https://github.github.com/gh-stack/) (`gh stack`), Claude
+Code, and Codex.
 
 ## Notes / operational caveats
 
@@ -144,6 +145,14 @@ all resolving in-guest afterward. A few operational notes still apply:
   its **last** step, after the reboot-sensitive installs — the base snapshot
   then captures a self-patching guest; or keep the default and patch manually
   ("Check for updates" in Settings, reboot, re-run `Save-BaseSnapshot.sh`).
+- **`gh stack` provisions best-effort.** Like the `gh` install it follows, the
+  [GitHub Stacked PRs](https://github.github.com/gh-stack/) step never fails the
+  run: the extension needs a `windows/arm64` release asset from `github/gh-stack`,
+  and the accompanying agent skill is fetched through the GitHub API, so it is
+  skipped on a guest where `gh` is not authenticated. Finish it in-guest and
+  re-run `Save-BaseSnapshot.sh` so it survives restores:
+  `gh auth login` then
+  `gh skill install github/gh-stack --agent claude-code --scope user --all --force`.
 - **Shared-folder path.** Scripts assume the guest mount is `\\Mac\workspace`
   (override `GuestShareUNC` in `config.json` if your Parallels build differs).
 - **Provisioning runs as a non-interactive (batch) scheduled task — no login
