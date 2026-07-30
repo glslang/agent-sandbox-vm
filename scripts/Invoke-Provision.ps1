@@ -252,8 +252,9 @@ Write-Host "  GitHub CLI installed: $(gh --version | Select-Object -First 1)"
 #
 # Best-effort: the skill half needs an authenticated `gh`, which a fresh VM does
 # not have, and neither half is worth aborting a provisioning run that has
-# already installed the compiler toolchain. Install-GhStack.ps1 is idempotent,
-# so the retry printed below (and in the final banner) just works.
+# already installed the compiler toolchain. Whatever is left outstanding is
+# reported with its own remedy in the final banner, and Install-GhStack.ps1 is
+# idempotent, so re-running it is always safe.
 Write-Host "[10/17] Installing GitHub Stacked PRs (gh stack)..."
 
 $ghStackScript = @(
