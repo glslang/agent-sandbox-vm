@@ -74,7 +74,7 @@ function Invoke-Download {
 # raises a TERMINATING error ("...overridden by a policy defined at a more
 # specific scope"). That is thrown via ThrowTerminatingError, so -ErrorAction
 # SilentlyContinue does NOT suppress it -- only try/catch does.
-Write-Host "[1/9] Setting execution policy..."
+Write-Host "[1/10] Setting execution policy..."
 try {
     Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
     Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
@@ -92,7 +92,7 @@ try {
 # "Check for updates" in Settings still works -- only AUTOMATIC download/
 # install/restart is off, deliberately, so snapshot restores stay deterministic
 # and agent sessions never get surprise-rebooted.
-Write-Host "[2/9] Disabling automatic Windows Update (no mid-provision restart)..."
+Write-Host "[2/10] Disabling automatic Windows Update (no mid-provision restart)..."
 $au = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
 New-Item -Path $au -Force | Out-Null
 Set-ItemProperty -Path $au -Name NoAutoUpdate -Value 1 -Type DWord
@@ -100,7 +100,7 @@ Stop-Service -Name wuauserv, UsoSvc -Force -ErrorAction SilentlyContinue
 Write-Host "  Automatic updates disabled (manual check still available)."
 
 # -- 1. Node.js (ARM64 zip -- nodejs.org ships no arm64 MSI) --
-Write-Host "[3/9] Installing Node.js (ARM64 zip)..."
+Write-Host "[3/10] Installing Node.js (ARM64 zip)..."
 $nodeIndex = Invoke-RestMethod -Uri "https://nodejs.org/dist/index.json" -UseBasicParsing
 $nodeRel = $nodeIndex | Where-Object { $_.lts -and ($_.files -contains 'win-arm64-zip') } | Select-Object -First 1
 if (-not $nodeRel) { throw "No LTS Node.js release with a win-arm64-zip was found." }
@@ -135,7 +135,7 @@ Write-Host "  Node installed: $(node --version)  npm: $(npm --version)"
 # makes -Wait return as soon as the --wait bootstrapper exits, i.e. exactly when
 # the install is done. (Verified: identical args hang with -NoNewWindow, finish
 # in ~7 min without it.)
-Write-Host "[4/9] Installing VS Build Tools (ARM64) -- this takes ~10-20 min..."
+Write-Host "[4/10] Installing VS Build Tools (ARM64) -- this takes ~10-20 min..."
 $vsInstaller = "$env:TEMP\vs_buildtools.exe"
 Invoke-Download "https://aka.ms/vs/18/stable/vs_buildtools.exe" $vsInstaller
 $proc = Start-Process $vsInstaller -ArgumentList @(
@@ -159,7 +159,7 @@ if (-not $clExe) { throw "VS Build Tools: native ARM64 cl.exe not found under $v
 Write-Host "  VS Build Tools installed. cl.exe: $($clExe.FullName)"
 
 # -- 3. Rust (aarch64 MSVC toolchain) --
-Write-Host "[5/9] Installing Rust (aarch64-pc-windows-msvc)..."
+Write-Host "[5/10] Installing Rust (aarch64-pc-windows-msvc)..."
 Invoke-Download "https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe" "$env:TEMP\rustup-init.exe"
 & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --default-host aarch64-pc-windows-msvc
 Update-Path
@@ -171,7 +171,7 @@ Write-Host "  Rust installed: $(rustc --version)"
 # toolchain (python-build-standalone, which has native win-arm64 builds) -- so we
 # get both the package/venv manager AND Python without a python.org ARM64 MSI.
 # Use `uv venv` (the uv equivalent of `python -m venv`) / `uv run` for envs.
-Write-Host "[6/9] Installing uv + Python (aarch64)..."
+Write-Host "[6/10] Installing uv + Python (aarch64)..."
 $uvRel = Invoke-RestMethod -Uri "https://api.github.com/repos/astral-sh/uv/releases/latest" -Headers $GhHeaders -UseBasicParsing
 $uvAsset = $uvRel.assets | Where-Object { $_.name -eq 'uv-aarch64-pc-windows-msvc.zip' } | Select-Object -First 1
 if (-not $uvAsset) { throw "No aarch64 uv asset found in the latest uv release." }
@@ -201,7 +201,7 @@ Assert-CommandAvailable -Name "python" -InstallHint "uv --default installs the p
 Write-Host "  Python (uv-managed): $(python --version)"
 
 # -- 5. Git for Windows (ARM64, silent) --
-Write-Host "[7/9] Installing Git for Windows (ARM64)..."
+Write-Host "[7/10] Installing Git for Windows (ARM64)..."
 try {
     $gitRel = Invoke-RestMethod -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" -Headers $GhHeaders -UseBasicParsing
     $gitAsset = $gitRel.assets | Where-Object { $_.name -match '^Git-.*-arm64\.exe$' } | Select-Object -First 1
@@ -229,7 +229,7 @@ try {
 }
 
 # -- 6. GitHub CLI (ARM64 MSI, non-fatal) --
-Write-Host "[8/9] Installing GitHub CLI (ARM64)..."
+Write-Host "[8/10] Installing GitHub CLI (ARM64)..."
 try {
     $ghRel = Invoke-RestMethod -Uri "https://api.github.com/repos/cli/cli/releases/latest" -Headers $GhHeaders -UseBasicParsing
     $ghAsset = $ghRel.assets | Where-Object { $_.name -match 'windows_arm64\.msi$' } | Select-Object -First 1
@@ -246,8 +246,56 @@ try {
     Write-Warning "  GitHub CLI install failed: $($_.Exception.Message)"
 }
 
-# -- 7. Claude Code + Codex CLI (npm global) --
-Write-Host "[9/9] Installing Claude Code + Codex CLI..."
+# -- 7. GitHub Stacked PRs (gh stack, non-fatal) --
+# https://github.github.com/gh-stack/ -- the `gh stack` extension plus the agent
+# skill that teaches Claude Code and Codex how to drive it. The Hyper-V path
+# shares scripts/Install-GhStack.ps1 for this; here the provisioner is a single
+# self-contained file dropped into the Parallels share, so it is inlined.
+#
+# Non-fatal throughout, matching the gh install above: gh may be missing, this
+# guest is aarch64 (which needs an ARM64 gh-stack release asset), and the skill
+# half needs an authenticated gh that a fresh guest does not have.
+Write-Host "[9/10] Installing GitHub Stacked PRs (gh stack)..."
+Update-Path
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    Write-Warning "  gh is not on PATH; skipping gh-stack."
+} else {
+    # `gh extension install` needs no auth for a public repo. --force upgrades an
+    # existing copy and is a no-op when already current, so this is re-runnable.
+    gh extension install github/gh-stack --force
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("  'gh extension install github/gh-stack' failed (exit $LASTEXITCODE). " +
+                       "Check that github/gh-stack publishes a windows/arm64 binary.")
+    } else {
+        Write-Host "  gh-stack extension installed."
+
+        # `gh skill install` reads the repo through the API, so it needs auth.
+        gh skill --help *> $null
+        $hasSkillCmd = ($LASTEXITCODE -eq 0)
+        gh auth status *> $null
+        $isAuthed = ($LASTEXITCODE -eq 0)
+
+        if (-not $hasSkillCmd) {
+            Write-Warning "  This gh has no 'gh skill' command; skipping the gh-stack skill."
+        } elseif (-not $isAuthed) {
+            Write-Warning "  gh is not authenticated; skipping the gh-stack skill. Later, run:"
+            Write-Warning "      gh auth login"
+            Write-Warning "      gh skill install github/gh-stack --agent claude-code --scope user --all --force"
+        } else {
+            foreach ($agent in @("claude-code", "codex")) {
+                gh skill install github/gh-stack --agent $agent --scope user --all --force
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "  gh-stack skill install failed for '$agent' (exit $LASTEXITCODE)."
+                } else {
+                    Write-Host "  gh-stack skill installed for '$agent' (user scope)."
+                }
+            }
+        }
+    }
+}
+
+# -- 8. Claude Code + Codex CLI (npm global) --
+Write-Host "[10/10] Installing Claude Code + Codex CLI..."
 & "$nodeDest\npm.cmd" install -g @anthropic-ai/claude-code
 Update-Path
 Write-Host "  Claude Code installed: $(claude --version)"
@@ -259,7 +307,7 @@ try { Write-Host "  Codex CLI installed: $(codex --version)" } catch { Write-War
 New-Item -ItemType Directory -Force -Path "C:\workspace" | Out-Null
 
 # -- Optional: re-arm automatic Windows Update --
-# [2/9] turned automatic updates off so nothing could reboot the guest while
+# [2/10] turned automatic updates off so nothing could reboot the guest while
 # this script runs. Default is to LEAVE them off (deterministic snapshot
 # restores; no surprise restarts mid agent session). `Start-Provision.sh
 # --rearm-updates` re-arms them here -- last, now that the reboot-sensitive

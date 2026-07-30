@@ -90,6 +90,7 @@ claude login
 | `scripts/New-UUPDumpISO.ps1` | Host | Optional: builds a Windows ISO from UUP dump (defaults to Windows Server 2025 amd64; `-Version`/`-Architecture`/`-Edition` selectable) |
 | `scripts/Start-Provision.ps1` | Host | Switches to Default Switch, copies VS layout + provisioner into VM |
 | `scripts/Invoke-Provision.ps1` | **VM** | Installs VS Build Tools, Rust (MSVC), Node.js, Claude Code, enables PSRemoting |
+| `scripts/Install-GhStack.ps1` | **VM** | Installs/upgrades the `gh stack` extension + the gh-stack agent skill; re-runnable after `gh auth login` |
 | `scripts/Save-BaseSnapshot.ps1` | Host | Captures `CleanProvisionedBase` checkpoint |
 | `scripts/Save-VMCredentials.ps1` | Host | Encrypts VM creds to `~/.agent-sandbox/vms/<VMName>/vm-cred.xml` |
 | `Start-Session.ps1` | Host | Daily driver: restore/switch network/sync project/open console |
@@ -144,6 +145,7 @@ Credentials are stored per VM as encrypted `vm-cred.xml` files (only readable by
 - Python 3.13 (`Python.Python.3.13` via winget)
 - uv (`astral-sh.uv` via winget) — Python package/venv manager (`uv venv`, `uv run`)
 - GitHub CLI (`gh` via winget)
+- [GitHub Stacked PRs](https://github.github.com/gh-stack/) — the `gh stack` extension plus the gh-stack agent skill, installed by `scripts/Install-GhStack.ps1`
 - TTD command line utility (`Microsoft.TimeTravelDebugging` via winget)
 - Claude Code (`@anthropic-ai/claude-code`) authenticated via OAuth
 - OpenAI Codex CLI (`@openai/codex` via npm)

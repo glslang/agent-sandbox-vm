@@ -65,6 +65,13 @@ try {
               -Destination "C:\Invoke-Provision.ps1"
     Write-Host "  Copied: Invoke-Provision.ps1"
 
+    # Invoke-Provision.ps1 runs this for the gh-stack (GitHub Stacked PRs) step,
+    # and it stays in the VM so it can be re-run after `gh auth login`.
+    Copy-Item -ToSession $session `
+              -Path "$PSScriptRoot\Install-GhStack.ps1" `
+              -Destination "C:\Install-GhStack.ps1"
+    Write-Host "  Copied: Install-GhStack.ps1"
+
     # Copy optional kernel debugging setup scripts. Setup-KernelDebugger.ps1 is
     # useful when this VM is the debugger for another VM.
     Copy-Item -ToSession $session `

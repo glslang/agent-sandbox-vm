@@ -64,7 +64,9 @@ Then **inside the VM**, run:
 powershell -ExecutionPolicy RemoteSigned -File C:\Invoke-Provision.ps1
 ```
 
-This installs PowerShell 7 (`pwsh`), VS Build Tools, Rust (MSVC), Node.js, Python (with the `uv` package/venv manager), Git, GitHub CLI (`gh`), Windows Terminal, Oh My Posh (with CascadiaCode Nerd Font), TTD command line utility, Claude Code, and OpenAI Codex CLI. It then prompts you to authenticate with Claude via OAuth — skip this if you only need Codex CLI.
+This installs PowerShell 7 (`pwsh`), VS Build Tools, Rust (MSVC), Node.js, Python (with the `uv` package/venv manager), Git, GitHub CLI (`gh`), [GitHub Stacked PRs](https://github.github.com/gh-stack/) (`gh stack`), Windows Terminal, Oh My Posh (with CascadiaCode Nerd Font), TTD command line utility, Claude Code, and OpenAI Codex CLI. It then prompts you to authenticate with Claude via OAuth — skip this if you only need Codex CLI.
+
+The `gh stack` step is best-effort: the extension always installs, but the matching agent skill is fetched through the GitHub API and needs an authenticated `gh`, which a fresh VM does not have. If the provisioner reports that, finish it before snapshotting — see [Stacked pull requests](#stacked-pull-requests).
 
 ### Step 4 -- Snapshot
 
@@ -109,6 +111,33 @@ codex    # OpenAI Codex CLI
 .\scripts\Copy-Artifacts.ps1 -VMName AgentDevSandbox -WaitForShutdown
 .\scripts\Copy-Artifacts.ps1 -VMName AgentDevSandbox -ExtraPatterns "*.json","*.toml"
 ```
+
+### Stacked pull requests
+
+The VM ships [GitHub Stacked PRs](https://github.github.com/gh-stack/) — the `gh stack` extension, which breaks a large change into a chain of small PRs that each build on the one below it — plus the gh-stack agent skill, so Claude Code and Codex know how to drive it.
+
+```powershell
+gh stack init              # start a stack (first branch targets the trunk)
+gh stack add api-endpoints # add a branch on top
+gh stack push              # push every branch in the stack
+gh stack submit            # open/update one PR per branch, linked as a stack
+gh stack view              # show the stack with per-layer PR status
+gh stack sync              # fetch, cascade-rebase, and push in one step
+```
+
+`gh stack` talks to GitHub, so start the session with `-Internet` and authenticate once inside the VM:
+
+```powershell
+gh auth login
+```
+
+If provisioning warned that the gh-stack skill was skipped (it needs an authenticated `gh`), install it after logging in and then re-take the base snapshot so it persists:
+
+```powershell
+powershell -ExecutionPolicy RemoteSigned -File C:\Install-GhStack.ps1 -SkipExtension
+```
+
+`C:\Install-GhStack.ps1` is idempotent, so re-running it to upgrade the extension is always safe. It installs the skill at user scope (`~\.claude\skills`, `~\.codex\skills`), which is why it applies to every project you sync into `C:\workspace`.
 
 ### Kernel debugging
 
@@ -180,6 +209,7 @@ agent-sandbox-vm/
 |   |-- Attach-ISO.ps1         # Alternative: boot from DVD if DISM not needed
 |   |-- Start-Provision.ps1    # Host-side: switches network, copies files into VM
 |   |-- Invoke-Provision.ps1   # VM-side: installs toolchain + Claude Code
+|   |-- Install-GhStack.ps1    # VM-side: installs `gh stack` + the gh-stack skill
 |   |-- Setup-KernelDebugger.ps1 # Host-side: WinDbg + KDNET firewall setup
 |   |-- Setup-KernelDebuggee.ps1 # VM-side: BCD/KDNET debuggee setup
 |   |-- Save-BaseSnapshot.ps1  # Takes the clean base snapshot
