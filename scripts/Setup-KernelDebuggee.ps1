@@ -182,15 +182,20 @@ function Get-TokenFilterPolicyValue {
 function Get-CompetingWinRmRule {
     param(
         [Parameter(Mandatory = $true)]
-        [int]$Port
+        [int[]]$Port
     )
 
     # Windows Firewall allow rules are additive, so Enable-PSRemoting's own
     # exceptions keep the port open at their own wider scope no matter how
     # narrow this script's rule is. Match on the port filter rather than on rule
     # names, which are localized and vary by Windows version.
+    $wantedPorts = @($Port | ForEach-Object { [string]$_ })
+
     Get-NetFirewallPortFilter -All |
-        Where-Object { $_.Protocol -eq "TCP" -and ($_.LocalPort -contains [string]$Port) } |
+        Where-Object {
+            $_.Protocol -eq "TCP" -and
+            @($_.LocalPort | Where-Object { $wantedPorts -contains $_ }).Count -gt 0
+        } |
         Get-NetFirewallRule |
         Where-Object {
             $_.Name -ne $WinRmRuleId -and
@@ -200,34 +205,42 @@ function Get-CompetingWinRmRule {
         }
 }
 
-function Test-WinRmListenerPort {
+function Get-WinRmListenerTransport {
     param(
         [Parameter(Mandatory = $true)]
         [int]$Port
     )
 
-    # $false only when the WSMan config was readable and nothing is bound to
-    # this port; an unreadable config returns $true so this never warns on a
-    # guess.
+    # "None" only when the WSMan config was readable and nothing is bound to
+    # this port; "Unknown" whenever it could not be read, so callers fall back
+    # to a port heuristic instead of asserting a transport this never saw.
     try {
         $listeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop)
     } catch {
-        return $true
+        return "Unknown"
     }
 
     foreach ($listener in $listeners) {
         try {
-            $listenerPort = (Get-Item -Path (Join-Path $listener.PSPath "Port") -ErrorAction Stop).Value
+            $settings = @(Get-ChildItem -Path $listener.PSPath -ErrorAction Stop)
         } catch {
-            return $true
+            return "Unknown"
         }
 
-        if ([int]$listenerPort -eq $Port) {
-            return $true
+        $listenerPort = ($settings | Where-Object { $_.Name -eq "Port" }).Value
+        if (-not $listenerPort -or [int]$listenerPort -ne $Port) {
+            continue
         }
+
+        $transport = ($settings | Where-Object { $_.Name -eq "Transport" }).Value
+        if ($transport) {
+            return $transport.ToString().ToUpperInvariant()
+        }
+
+        return "Unknown"
     }
 
-    $false
+    "None"
 }
 
 function Enable-DebuggeeRemoting {
@@ -252,9 +265,13 @@ function Enable-DebuggeeRemoting {
 
     # Narrow the exceptions Enable-PSRemoting just (re)created to the same
     # allowlist, otherwise -WinRmRemoteAddress would report a boundary the
-    # firewall does not actually enforce.
+    # firewall does not actually enforce. 5985 is always in scope because the
+    # call above reopens the default HTTP listener there whatever -WinRmPort
+    # says, and that endpoint would otherwise keep its wider exception.
+    $scopedPorts = @(@($Port, 5985) | Select-Object -Unique)
+
     $adjustedRules = @()
-    foreach ($rule in Get-CompetingWinRmRule -Port $Port) {
+    foreach ($rule in Get-CompetingWinRmRule -Port $scopedPorts) {
         $priorAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
 
         try {
@@ -379,8 +396,18 @@ function Disable-DebuggeeRemoting {
     }
 
     if (-not $state) {
-        Write-Host "  No saved state at $RemotingStatePath; restoring nothing but this script's own settings."
-        Restore-TokenFilterPolicy -Value $null
+        # No record means no evidence this script set the policy, so deleting it
+        # could silently undo a value configured independently. Report it and
+        # let the operator decide.
+        Write-Host "  No saved state at $RemotingStatePath; removed only this script's own firewall rule."
+
+        $currentPolicy = Get-TokenFilterPolicyValue
+        if ($null -eq $currentPolicy) {
+            Write-Host "  $TokenFilterPolicyName not present."
+        } else {
+            Write-Host "  $TokenFilterPolicyName is $currentPolicy and was left alone. Remove it with:"
+            Write-Host "    Remove-ItemProperty -Path '$PolicyKeyPath' -Name $TokenFilterPolicyName"
+        }
     } else {
         foreach ($record in @($state.AdjustedRules)) {
             if (-not $record) {
@@ -531,21 +558,37 @@ if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and config
         Write-Host "  Allowed remotes: $($WinRmRemoteAddress -join ', ')"
         Write-Host "  Profiles:        $($WinRmFirewallProfile -join ', ')"
 
+        if ($WinRmPort -ne 5985) {
+            Write-Host "  Also scoped:     5985/tcp, the listener Enable-PSRemoting opens"
+        }
+
         $debuggeeAddresses = Get-DebuggeeIPv4Address
         if ($debuggeeAddresses.Count -gt 0) {
             Write-Host "  This VM:         $($debuggeeAddresses -join ', ')"
         }
 
-        if (-not (Test-WinRmListenerPort -Port $WinRmPort)) {
+        $transport = Get-WinRmListenerTransport -Port $WinRmPort
+        if ($transport -eq "None") {
             Write-Warning "  No WinRM listener is bound to port $WinRmPort. This script opens the firewall but creates no listener; configure one (for example 'winrm quickconfig -transport:https' for 5986) before connecting."
         }
 
-        # Match the connect command to the port that was actually opened.
+        # Match the connect command to the port that was opened and to the
+        # transport actually configured there. The port only decides it when the
+        # WSMan config could not be read.
         $connectArgs = "-ComputerName <debuggee-ip>"
         if ($WinRmPort -ne 5985) {
             $connectArgs += " -Port $WinRmPort"
         }
-        if ($WinRmPort -eq 5986) {
+
+        $useSsl = if ($transport -eq "HTTPS") {
+            $true
+        } elseif ($transport -eq "HTTP") {
+            $false
+        } else {
+            $WinRmPort -eq 5986
+        }
+
+        if ($useSsl) {
             $connectArgs += " -UseSSL"
         }
 
