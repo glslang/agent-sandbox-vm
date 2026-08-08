@@ -47,7 +47,10 @@ param(
     [ValidateSet("Domain", "Private", "Public", "Any")]
     [string[]]$WinRmFirewallProfile = @("Any"),
 
-    # TCP port of the WinRM HTTP listener (5986 if the listener is HTTPS).
+    # TCP port the firewall rule opens and the printed connect command targets.
+    # This script creates no listener of its own, so anything other than 5985
+    # (the HTTP listener Enable-PSRemoting sets up) needs a listener you
+    # configured yourself; the run warns when none is bound to this port.
     [Parameter(ParameterSetName = "Enable")]
     [ValidateRange(1, 65535)]
     [int]$WinRmPort = 5985,
@@ -69,9 +72,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Name is the stable identity used for lookup, update, and removal; DisplayName
+# is only what the firewall UI shows and is not unique.
+$WinRmRuleId = "AgentSandbox-Debuggee-WinRM"
 $WinRmRuleName = "Agent Sandbox Debuggee WinRM"
 $PolicyKeyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
 $TokenFilterPolicyName = "LocalAccountTokenFilterPolicy"
+
+# What this script changed outside its own firewall rule, so -Disable can put
+# the machine back the way it found it instead of guessing at defaults.
+$RemotingStatePath = Join-Path $env:ProgramData "agent-sandbox\kernel-debuggee-remoting.json"
 
 function Invoke-NativeCommand {
     param(
@@ -123,6 +133,103 @@ function Get-DebuggeeIPv4Address {
     @($addresses)
 }
 
+function Get-RemotingState {
+    if (-not (Test-Path $RemotingStatePath)) {
+        return $null
+    }
+
+    try {
+        Get-Content -Path $RemotingStatePath -Raw | ConvertFrom-Json
+    } catch {
+        Write-Warning "Could not read $RemotingStatePath ($($_.Exception.Message)); -Disable will only remove this script's own settings."
+        $null
+    }
+}
+
+function Save-RemotingState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$TokenFilterPolicy,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$AdjustedRule
+    )
+
+    $stateDir = Split-Path -Path $RemotingStatePath -Parent
+    if (-not (Test-Path $stateDir)) {
+        New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+    }
+
+    # A null TokenFilterPolicy records "the value did not exist", which is what
+    # -Disable restores by deleting it again.
+    [ordered]@{
+        TokenFilterPolicy = $TokenFilterPolicy
+        AdjustedRules     = @($AdjustedRule)
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path $RemotingStatePath -Encoding UTF8
+}
+
+function Get-TokenFilterPolicyValue {
+    $policy = Get-ItemProperty -Path $PolicyKeyPath -Name $TokenFilterPolicyName -ErrorAction SilentlyContinue
+    if (-not $policy) {
+        return $null
+    }
+
+    [int]$policy.$TokenFilterPolicyName
+}
+
+function Get-CompetingWinRmRule {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port
+    )
+
+    # Windows Firewall allow rules are additive, so Enable-PSRemoting's own
+    # exceptions keep the port open at their own wider scope no matter how
+    # narrow this script's rule is. Match on the port filter rather than on rule
+    # names, which are localized and vary by Windows version.
+    Get-NetFirewallPortFilter -All |
+        Where-Object { $_.Protocol -eq "TCP" -and ($_.LocalPort -contains [string]$Port) } |
+        Get-NetFirewallRule |
+        Where-Object {
+            $_.Name -ne $WinRmRuleId -and
+            $_.Direction -eq "Inbound" -and
+            $_.Action -eq "Allow" -and
+            $_.Enabled -eq "True"
+        }
+}
+
+function Test-WinRmListenerPort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port
+    )
+
+    # $false only when the WSMan config was readable and nothing is bound to
+    # this port; an unreadable config returns $true so this never warns on a
+    # guess.
+    try {
+        $listeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction Stop)
+    } catch {
+        return $true
+    }
+
+    foreach ($listener in $listeners) {
+        try {
+            $listenerPort = (Get-Item -Path (Join-Path $listener.PSPath "Port") -ErrorAction Stop).Value
+        } catch {
+            return $true
+        }
+
+        if ([int]$listenerPort -eq $Port) {
+            return $true
+        }
+    }
+
+    $false
+}
+
 function Enable-DebuggeeRemoting {
     param(
         [Parameter(Mandatory = $true)]
@@ -135,35 +242,60 @@ function Enable-DebuggeeRemoting {
         [string[]]$FirewallProfile
     )
 
+    $priorPolicy = Get-TokenFilterPolicyValue
+
     # -SkipNetworkProfileCheck: the debuggee usually sits on a Hyper-V internal
     # switch, which Windows classifies as a Public network.
     Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
     Set-Service WinRM -StartupType Automatic
     Write-Host "  PowerShell remoting enabled; WinRM starts automatically."
 
-    # Enable-PSRemoting's own Public-profile rule is pinned to the local subnet,
-    # so carry a rule this script owns and can scope and remove on -Disable.
-    $existingRule = Get-NetFirewallRule -DisplayName $WinRmRuleName -ErrorAction SilentlyContinue
-    if ($existingRule) {
-        foreach ($rule in $existingRule) {
-            Set-NetFirewallRule `
-                -InputObject $rule `
-                -Direction Inbound `
-                -Action Allow `
-                -Enabled True `
-                -Profile $FirewallProfile
+    # Narrow the exceptions Enable-PSRemoting just (re)created to the same
+    # allowlist, otherwise -WinRmRemoteAddress would report a boundary the
+    # firewall does not actually enforce.
+    $adjustedRules = @()
+    foreach ($rule in Get-CompetingWinRmRule -Port $Port) {
+        $priorAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
 
-            $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
-                -Protocol TCP `
-                -LocalPort $Port
-
-            $rule | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter `
-                -RemoteAddress $RemoteAddress
+        try {
+            Set-NetFirewallRule -Name $rule.Name -RemoteAddress $RemoteAddress
+        } catch {
+            # Group-policy rules cannot be edited locally; say so rather than
+            # letting the summary claim a scope this rule still overrides.
+            Write-Warning "  Could not narrow existing WinRM exception '$($rule.DisplayName)': $($_.Exception.Message)"
+            continue
         }
+
+        $adjustedRules += [pscustomobject]@{
+            Name          = $rule.Name
+            RemoteAddress = $priorAddress
+        }
+
+        Write-Host "  Narrowed existing WinRM exception: $($rule.DisplayName) (was $($priorAddress -join ', '))"
+    }
+
+    # Carry a rule this script owns so -Disable has something unambiguous to
+    # remove, and so the scope survives a later Enable-PSRemoting run.
+    $existingRule = Get-NetFirewallRule -Name $WinRmRuleId -ErrorAction SilentlyContinue
+    if ($existingRule) {
+        Set-NetFirewallRule `
+            -Name $WinRmRuleId `
+            -Direction Inbound `
+            -Action Allow `
+            -Enabled True `
+            -Profile $FirewallProfile
+
+        Get-NetFirewallRule -Name $WinRmRuleId | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
+            -Protocol TCP `
+            -LocalPort $Port
+
+        Get-NetFirewallRule -Name $WinRmRuleId | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter `
+            -RemoteAddress $RemoteAddress
 
         Write-Host "  Firewall rule updated: $WinRmRuleName"
     } else {
         New-NetFirewallRule `
+            -Name $WinRmRuleId `
             -DisplayName $WinRmRuleName `
             -Direction Inbound `
             -Action Allow `
@@ -189,23 +321,82 @@ function Enable-DebuggeeRemoting {
         -Force | Out-Null
 
     Write-Host "  $TokenFilterPolicyName set to 1."
+
+    # Only the first run sees the machine's original settings. A rerun must not
+    # overwrite that record with values this script already changed, or -Disable
+    # would restore its own configuration instead of the machine's.
+    $state = Get-RemotingState
+    if ($state) {
+        $knownRules = @(@($state.AdjustedRules) | ForEach-Object { $_.Name })
+        $newRules = @($adjustedRules | Where-Object { $knownRules -notcontains $_.Name })
+        if ($newRules.Count -gt 0) {
+            Save-RemotingState `
+                -TokenFilterPolicy $state.TokenFilterPolicy `
+                -AdjustedRule (@($state.AdjustedRules) + $newRules)
+        }
+    } else {
+        Save-RemotingState -TokenFilterPolicy $priorPolicy -AdjustedRule $adjustedRules
+    }
+}
+
+function Restore-TokenFilterPolicy {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        if ($null -eq (Get-TokenFilterPolicyValue)) {
+            Write-Host "  $TokenFilterPolicyName not present."
+        } else {
+            Remove-ItemProperty -Path $PolicyKeyPath -Name $TokenFilterPolicyName
+            Write-Host "  $TokenFilterPolicyName removed; network logons are filtered again."
+        }
+
+        return
+    }
+
+    New-ItemProperty `
+        -Path $PolicyKeyPath `
+        -Name $TokenFilterPolicyName `
+        -Value ([int]$Value) `
+        -PropertyType DWord `
+        -Force | Out-Null
+
+    Write-Host "  $TokenFilterPolicyName restored to its previous value ($Value)."
 }
 
 function Disable-DebuggeeRemoting {
-    $existingRule = Get-NetFirewallRule -DisplayName $WinRmRuleName -ErrorAction SilentlyContinue
+    $state = Get-RemotingState
+
+    $existingRule = Get-NetFirewallRule -Name $WinRmRuleId -ErrorAction SilentlyContinue
     if ($existingRule) {
-        $existingRule | Remove-NetFirewallRule
+        Remove-NetFirewallRule -Name $WinRmRuleId
         Write-Host "  Firewall rule removed: $WinRmRuleName"
     } else {
         Write-Host "  Firewall rule not present: $WinRmRuleName"
     }
 
-    $policy = Get-ItemProperty -Path $PolicyKeyPath -Name $TokenFilterPolicyName -ErrorAction SilentlyContinue
-    if ($policy) {
-        Remove-ItemProperty -Path $PolicyKeyPath -Name $TokenFilterPolicyName
-        Write-Host "  $TokenFilterPolicyName removed; network logons are filtered again."
+    if (-not $state) {
+        Write-Host "  No saved state at $RemotingStatePath; restoring nothing but this script's own settings."
+        Restore-TokenFilterPolicy -Value $null
     } else {
-        Write-Host "  $TokenFilterPolicyName not present."
+        foreach ($record in @($state.AdjustedRules)) {
+            if (-not $record) {
+                continue
+            }
+
+            try {
+                Set-NetFirewallRule -Name $record.Name -RemoteAddress @($record.RemoteAddress)
+                Write-Host "  Restored WinRM exception scope: $($record.Name) ($(@($record.RemoteAddress) -join ', '))"
+            } catch {
+                Write-Warning "  Could not restore '$($record.Name)': $($_.Exception.Message)"
+            }
+        }
+
+        Restore-TokenFilterPolicy -Value $state.TokenFilterPolicy
+        Remove-Item -Path $RemotingStatePath -Force
     }
 
     # WinRM itself stays on: provisioned sandbox VMs enable it during
@@ -331,11 +522,11 @@ if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and config
         Write-Host "Host access needs another pass ($remotingWarning)"
         Write-Host "Run this in the VM as Administrator:"
         Write-Host "  Enable-PSRemoting -Force -SkipNetworkProfileCheck"
-        Write-Host "  New-NetFirewallRule -DisplayName '$WinRmRuleName' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $WinRmPort -RemoteAddress $($WinRmRemoteAddress -join ',') -Profile $($WinRmFirewallProfile -join ',')"
+        Write-Host "  New-NetFirewallRule -Name '$WinRmRuleId' -DisplayName '$WinRmRuleName' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $WinRmPort -RemoteAddress $($WinRmRemoteAddress -join ',') -Profile $($WinRmFirewallProfile -join ',')"
         Write-Host "  New-ItemProperty -Path '$PolicyKeyPath' -Name $TokenFilterPolicyName -Value 1 -PropertyType DWord -Force"
     } elseif (-not $SkipRemoting) {
         Write-Host ""
-        Write-Host "WinRM listener:"
+        Write-Host "WinRM access:"
         Write-Host "  Port:            $WinRmPort/tcp"
         Write-Host "  Allowed remotes: $($WinRmRemoteAddress -join ', ')"
         Write-Host "  Profiles:        $($WinRmFirewallProfile -join ', ')"
@@ -345,10 +536,23 @@ if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and config
             Write-Host "  This VM:         $($debuggeeAddresses -join ', ')"
         }
 
+        if (-not (Test-WinRmListenerPort -Port $WinRmPort)) {
+            Write-Warning "  No WinRM listener is bound to port $WinRmPort. This script opens the firewall but creates no listener; configure one (for example 'winrm quickconfig -transport:https' for 5986) before connecting."
+        }
+
+        # Match the connect command to the port that was actually opened.
+        $connectArgs = "-ComputerName <debuggee-ip>"
+        if ($WinRmPort -ne 5985) {
+            $connectArgs += " -Port $WinRmPort"
+        }
+        if ($WinRmPort -eq 5986) {
+            $connectArgs += " -UseSSL"
+        }
+
         Write-Host ""
         Write-Host "Copy binaries in from the debugger host with:"
         Write-Host '  Set-Item WSMan:\localhost\Client\TrustedHosts -Value <debuggee-ip> -Concatenate -Force'
-        Write-Host '  $session = New-PSSession -ComputerName <debuggee-ip> -Credential (Get-Credential)'
+        Write-Host "  `$session = New-PSSession $connectArgs -Credential (Get-Credential)"
         Write-Host '  Copy-Item -ToSession $session C:\build\driver.sys -Destination C:\workspace\'
         Write-Host ""
         Write-Host "If KDNET claims this VM's only network adapter and guest networking stops working, add a second"
