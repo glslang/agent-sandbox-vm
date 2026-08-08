@@ -64,7 +64,9 @@ Then **inside the VM**, run:
 powershell -ExecutionPolicy RemoteSigned -File C:\Invoke-Provision.ps1
 ```
 
-This installs PowerShell 7 (`pwsh`), VS Build Tools, Rust (MSVC), Node.js, Python (with the `uv` package/venv manager), Git, GitHub CLI (`gh`), [GitHub Stacked PRs](https://github.github.com/gh-stack/) (`gh stack`), Windows Terminal, Oh My Posh (with CascadiaCode Nerd Font), TTD command line utility, Claude Code, and OpenAI Codex CLI. It then prompts you to authenticate with Claude via OAuth — skip this if you only need Codex CLI.
+This installs PowerShell 7 (`pwsh`), VS Build Tools, Rust (MSVC), Node.js, Python (with the `uv` package/venv manager), Git, GitHub CLI (`gh`), [GitHub Stacked PRs](https://github.github.com/gh-stack/) (`gh stack`), Windows Terminal, Oh My Posh (with CascadiaCode Nerd Font), TTD command line utility, Claude Code, OpenAI Codex CLI, and [Ollama](https://docs.ollama.com/quickstart) for local models. It then prompts you to authenticate with Claude via OAuth — skip this if you only need Codex CLI.
+
+Ollama is installed without any models — pull one before snapshotting if you want it in isolated sessions. See [Local models with Ollama](#local-models-with-ollama).
 
 The `gh stack` step is best-effort: the extension always installs, but the matching agent skill is fetched through the GitHub API and needs an authenticated `gh`, which a fresh VM does not have. If the provisioner reports that, finish it before snapshotting — see [Stacked pull requests](#stacked-pull-requests).
 
@@ -102,6 +104,7 @@ Your project is copied to `C:\workspace` inside the VM. Then:
 cd C:\workspace
 claude   # Claude Code
 codex    # OpenAI Codex CLI
+ollama   # local models (see below)
 ```
 
 ### Extract artifacts
@@ -140,6 +143,35 @@ powershell -ExecutionPolicy RemoteSigned -File C:\Install-GhStack.ps1 -SkipExten
 ```
 
 `C:\Install-GhStack.ps1` is idempotent, so re-running it to upgrade the extension is always safe. It installs the skill at user scope (`~\.claude\skills`, `~\.codex\skills`), which is why it applies to every project you sync into `C:\workspace`.
+
+### Local models with Ollama
+
+[Ollama](https://docs.ollama.com/quickstart) runs open-weight models on the VM itself and serves them over HTTP on `127.0.0.1:11434`. The server starts at login; models live in `%USERPROFILE%\.ollama\models`.
+
+Provisioning installs the runtime but **no models** — pulling one needs internet, so start the session with `-Internet` the first time:
+
+```powershell
+ollama pull gemma3:1b   # download a model
+ollama run gemma3:1b    # chat with it
+ollama list             # show what is downloaded
+ollama ps               # show what is currently loaded in memory
+```
+
+Once a model is pulled it answers with no internet at all, which is the point: pull it **before** taking the base snapshot and every isolated session starts with it already there.
+
+```powershell
+# inside the VM, with -Internet, before shutting down to snapshot
+ollama pull gemma3:1b
+```
+
+Anything on the VM can then reach it over the local API:
+
+```powershell
+$body = '{"model":"gemma3:1b","prompt":"why is the sky blue?","stream":false}'
+(Invoke-RestMethod http://127.0.0.1:11434/api/generate -Method Post -Body $body).response
+```
+
+Size the model to the VM, not to your host. The sandbox is created with 4 GB of RAM, so a model needs to fit in roughly 3 GB alongside the toolchain — 1B–4B parameter models at default quantization are the realistic range. Larger models either swap badly or fail to load. Give the VM more memory (`Set-VMMemory`) before reaching for a bigger one, and remember every pulled model also consumes VHDX space.
 
 ### Kernel debugging
 

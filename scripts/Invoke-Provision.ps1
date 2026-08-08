@@ -91,6 +91,45 @@ function Install-WingetPackage {
     }
 }
 
+function Wait-OllamaServer {
+    # `ollama pull` and `ollama run` are thin clients -- the work happens in a
+    # background server listening on 127.0.0.1:11434. The Windows installer
+    # starts that server and registers it to start at login, but it is not
+    # necessarily listening by the time winget returns, so poll for it and
+    # launch it here if it never shows up.
+    param(
+        [int]$TimeoutSeconds = 60
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $launched = $false
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-WebRequest -Uri "http://127.0.0.1:11434/api/version" -UseBasicParsing -TimeoutSec 3 | Out-Null
+            return $true
+        } catch {
+            # Not listening yet.
+        }
+
+        if (-not $launched) {
+            # Prefer the tray app: it is what the login entry runs, so the
+            # server behaves the same here as it will after every reboot.
+            $ollamaApp = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama app.exe"
+            if (Test-Path $ollamaApp) {
+                Start-Process -FilePath $ollamaApp | Out-Null
+            } else {
+                Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden | Out-Null
+            }
+            $launched = $true
+        }
+
+        Start-Sleep -Seconds 3
+    }
+
+    return $false
+}
+
 function Assert-CommandAvailable {
     param(
         [Parameter(Mandatory = $true)]
@@ -115,7 +154,7 @@ function Assert-CommandAvailable {
 # -- 0. Execution Policy --
 # Set machine-wide policy so npm-installed .ps1 wrappers (e.g. claude.ps1) run
 # in all future sessions without needing a per-process policy override each time.
-Write-Host "[1/17] Setting execution policy..."
+Write-Host "[1/18] Setting execution policy..."
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
 Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 
@@ -123,7 +162,7 @@ Write-Host "  ExecutionPolicy set to RemoteSigned (LocalMachine)."
 # Install the modern cross-platform PowerShell (pwsh). Windows ships only with
 # Windows PowerShell 5.1; pwsh is the preferred shell for agent tooling and is
 # the host targeted by the Oh My Posh profile init configured below.
-Write-Host "[2/17] Installing PowerShell 7..."
+Write-Host "[2/18] Installing PowerShell 7..."
 
 # This is the first winget call on the provisioning path, so make sure WinGet has
 # finished registering before relying on it.
@@ -133,7 +172,7 @@ $pwshCommand = Assert-CommandAvailable -Name "pwsh.exe" -InstallHint "PowerShell
 Write-Host "  PowerShell 7 installed: $(pwsh --version)"
 
 # -- 2. VS Build Tools --
-Write-Host "[3/17] Installing VS Build Tools..."
+Write-Host "[3/18] Installing VS Build Tools..."
 
 $layoutInstaller = "C:\vs-cache\layout\vs_buildtools.exe"
 $onlineInstaller = "$env:TEMP\vs_buildtools.exe"
@@ -165,7 +204,7 @@ if ($proc.ExitCode -notin 0, 3010) {
 }
 
 # -- 3. Rust (MSVC toolchain) --
-Write-Host "[4/17] Installing Rust..."
+Write-Host "[4/18] Installing Rust..."
 
 Invoke-WebRequest "https://win.rustup.rs/x86_64" -OutFile "$env:TEMP\rustup-init.exe"
 & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
@@ -174,7 +213,7 @@ rustup component add clippy rustfmt
 Write-Host "  Rust installed: $(rustc --version)"
 
 # -- 4. Node.js --
-Write-Host "[5/17] Installing Node.js..."
+Write-Host "[5/18] Installing Node.js..."
 
 Install-WingetPackage -Id "OpenJS.NodeJS" -DisplayName "Node.js"
 Assert-CommandAvailable -Name "node" -InstallHint "If Node was installed by winget, open a new elevated PowerShell session or verify C:\Program Files\nodejs is on PATH." | Out-Null
@@ -185,7 +224,7 @@ Write-Host "  Node installed: $(node --version)"
 # Install CPython system-wide. The winget package puts python.exe and its
 # Scripts\ dir on PATH, giving the agent a stock `python`/`pip` plus the
 # built-in `python -m venv` for virtual environments.
-Write-Host "[6/17] Installing Python..."
+Write-Host "[6/18] Installing Python..."
 
 Install-WingetPackage -Id "Python.Python.3.13" -DisplayName "Python 3.13"
 Assert-CommandAvailable -Name "python" -InstallHint "Python should be installed by winget; verify the install dir and its Scripts folder are on PATH." | Out-Null
@@ -194,7 +233,7 @@ Write-Host "  Python installed: $(python --version)"
 # -- 6. uv (Python package + venv manager) --
 # uv is the fast, modern alternative to pip/virtualenv. It provides `uv venv`
 # (the uv equivalent of `python -m venv`) and `uv run` for managed environments.
-Write-Host "[7/17] Installing uv..."
+Write-Host "[7/18] Installing uv..."
 
 Install-WingetPackage -Id "astral-sh.uv" -DisplayName "uv"
 Assert-CommandAvailable -Name "uv" -InstallHint "uv should be installed by winget." | Out-Null
@@ -217,7 +256,7 @@ if (-not $uvVenvOk) {
 Write-Host "  Verified: 'uv venv' creates a working virtual environment."
 
 # -- 7. Git for Windows (Git Bash) --
-Write-Host "[8/17] Installing Git for Windows..."
+Write-Host "[8/18] Installing Git for Windows..."
 
 Install-WingetPackage -Id "Git.Git" -DisplayName "Git for Windows"
 Refresh-Path
@@ -240,7 +279,7 @@ if ($gitBashExe) {
 }
 
 # -- 8. GitHub CLI --
-Write-Host "[9/17] Installing GitHub CLI..."
+Write-Host "[9/18] Installing GitHub CLI..."
 
 Install-WingetPackage -Id "GitHub.cli" -DisplayName "GitHub CLI"
 Assert-CommandAvailable -Name "gh" -InstallHint "GitHub CLI should be installed by winget." | Out-Null
@@ -255,7 +294,7 @@ Write-Host "  GitHub CLI installed: $(gh --version | Select-Object -First 1)"
 # already installed the compiler toolchain. Whatever is left outstanding is
 # reported with its own remedy in the final banner, and Install-GhStack.ps1 is
 # idempotent, so re-running it is always safe.
-Write-Host "[10/17] Installing GitHub Stacked PRs (gh stack)..."
+Write-Host "[10/18] Installing GitHub Stacked PRs (gh stack)..."
 
 $ghStackScript = @(
     (Join-Path $PSScriptRoot "Install-GhStack.ps1"),
@@ -303,13 +342,13 @@ if ($ghStackWarning) {
 }
 
 # -- 10. Windows Terminal --
-Write-Host "[11/17] Installing Windows Terminal..."
+Write-Host "[11/18] Installing Windows Terminal..."
 
 Install-WingetPackage -Id "Microsoft.WindowsTerminal" -DisplayName "Windows Terminal"
 Write-Host "  Windows Terminal installed."
 
 # -- 11. Oh My Posh --
-Write-Host "[12/17] Installing Oh My Posh..."
+Write-Host "[12/18] Installing Oh My Posh..."
 
 Install-WingetPackage -Id "JanDeDobbeleer.OhMyPosh" -DisplayName "Oh My Posh"
 Assert-CommandAvailable -Name "oh-my-posh" -InstallHint "Oh My Posh should be installed by winget." | Out-Null
@@ -341,28 +380,56 @@ Write-Host "  Configured profiles: $($profileTargets -join ', ')"
 Write-Host "  Themes directory: `$env:POSH_THEMES_PATH -- swap theme by editing your profile."
 
 # -- 12. TTD command line utility --
-Write-Host "[13/17] Installing TTD command line utility..."
+Write-Host "[13/18] Installing TTD command line utility..."
 
 Install-WingetPackage -Id "Microsoft.TimeTravelDebugging" -DisplayName "TTD command line utility"
 $ttdCommand = Assert-CommandAvailable -Name "ttd.exe" -InstallHint "TTD should be installed by winget."
 Write-Host "  TTD installed: $($ttdCommand.Source)"
 
 # -- 13. Claude Code --
-Write-Host "[14/17] Installing Claude Code..."
+Write-Host "[14/18] Installing Claude Code..."
 
 npm install -g @anthropic-ai/claude-code
 Refresh-Path
 Write-Host "  Claude Code installed: $(claude --version)"
 
 # -- 14. OpenAI Codex CLI --
-Write-Host "[15/17] Installing OpenAI Codex CLI..."
+Write-Host "[15/18] Installing OpenAI Codex CLI..."
 
 npm install -g @openai/codex
 Refresh-Path
 Write-Host "  Codex CLI installed: $(codex --version)"
 
-# -- 15. Authenticate --
-Write-Host "[16/17] Authenticating with Claude (optional)..."
+# -- 15. Ollama (local models) --
+# https://docs.ollama.com/quickstart -- runs open-weight models on the VM itself
+# and serves them over HTTP on 127.0.0.1:11434. Models are pulled over the
+# internet but answer offline once pulled, so a model fetched before the base
+# snapshot stays available in fully isolated sessions.
+Write-Host "[16/18] Installing Ollama..."
+
+Install-WingetPackage -Id "Ollama.Ollama" -DisplayName "Ollama"
+Assert-CommandAvailable -Name "ollama" -InstallHint "Ollama should be installed by winget; verify %LOCALAPPDATA%\Programs\Ollama is on PATH." | Out-Null
+
+# Bring the server up now rather than at next login, so a model can be pulled
+# in this same session -- before the base snapshot is taken.
+$ollamaServerUp = Wait-OllamaServer
+# 2>$null: with no server reachable the client writes a warning to stderr, which
+# Windows PowerShell can surface as a terminating NativeCommandError under
+# $ErrorActionPreference = "Stop".
+Write-Host "  Ollama installed: $(ollama --version 2>$null)"
+
+if ($ollamaServerUp) {
+    Write-Host "  Ollama server is answering on http://127.0.0.1:11434."
+    Write-Host "  Pull a model before snapshotting to use it offline, e.g.: ollama pull gemma3:1b"
+} else {
+    # Not fatal: the login entry gets another chance at every boot, and nothing
+    # else in the toolchain depends on the server being up right now.
+    Write-Warning "  The Ollama server is not answering on http://127.0.0.1:11434 yet."
+    Write-Warning "  It should start at next login; otherwise run 'ollama serve' inside the VM."
+}
+
+# -- 16. Authenticate --
+Write-Host "[17/18] Authenticating with Claude (optional)..."
 Write-Host "  Skip this step if you are using OpenAI Codex CLI only."
 Write-Host ""
 $reply = Read-Host "  Authenticate with Claude now? [Y/n]"
@@ -374,8 +441,8 @@ if ($reply -eq '' -or $reply -match '^[Yy]') {
     Write-Host "  Skipped. Run 'claude login' inside the VM whenever you need it."
 }
 
-# -- 16. Enable PSRemoting (for artifact extraction from host) --
-Write-Host "[17/17] Enabling PowerShell remoting..."
+# -- 17. Enable PSRemoting (for artifact extraction from host) --
+Write-Host "[18/18] Enabling PowerShell remoting..."
 
 Enable-PSRemoting -Force -SkipNetworkProfileCheck
 Set-Service WinRM -StartupType Automatic
