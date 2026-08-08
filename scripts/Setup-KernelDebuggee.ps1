@@ -205,6 +205,21 @@ function Get-CompetingWinRmRule {
         }
 }
 
+function Expand-FirewallProfile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Profile
+    )
+
+    # A rule's Profile is a flags value where "Any" stands for all three.
+    if ($Profile -contains "Any") {
+        return @("Domain", "Private", "Public")
+    }
+
+    @($Profile)
+}
+
 function Get-WinRmListenerTransport {
     param(
         [Parameter(Mandatory = $true)]
@@ -273,9 +288,36 @@ function Enable-DebuggeeRemoting {
     $adjustedRules = @()
     foreach ($rule in Get-CompetingWinRmRule -Port $scopedPorts) {
         $priorAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
+        $priorProfile = @("$($rule.Profile)" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $priorEnabled = "$($rule.Enabled)"
+
+        # A profile the caller did not ask for is as much of a hole as an
+        # address they did not ask for: an exception left on Public keeps the
+        # port open there even when only Private was requested. Only ever
+        # narrow -- widening someone else's rule to match a broader request
+        # would hand out access this script was never asked to grant.
+        $narrowedProfile = $null
+        $disableRule = $false
+
+        if (-not ($FirewallProfile -contains "Any")) {
+            $ruleProfiles = Expand-FirewallProfile -Profile $priorProfile
+            $overlap = @($ruleProfiles | Where-Object { $FirewallProfile -contains $_ })
+
+            if ($overlap.Count -eq 0) {
+                $disableRule = $true
+            } elseif ($overlap.Count -lt $ruleProfiles.Count) {
+                $narrowedProfile = $overlap
+            }
+        }
 
         try {
             Set-NetFirewallRule -Name $rule.Name -RemoteAddress $RemoteAddress
+
+            if ($disableRule) {
+                Set-NetFirewallRule -Name $rule.Name -Enabled False
+            } elseif ($narrowedProfile) {
+                Set-NetFirewallRule -Name $rule.Name -Profile $narrowedProfile
+            }
         } catch {
             # Group-policy rules cannot be edited locally; say so rather than
             # letting the summary claim a scope this rule still overrides.
@@ -286,9 +328,16 @@ function Enable-DebuggeeRemoting {
         $adjustedRules += [pscustomobject]@{
             Name          = $rule.Name
             RemoteAddress = $priorAddress
+            Profile       = $priorProfile
+            Enabled       = $priorEnabled
         }
 
-        Write-Host "  Narrowed existing WinRM exception: $($rule.DisplayName) (was $($priorAddress -join ', '))"
+        if ($disableRule) {
+            Write-Host "  Disabled existing WinRM exception outside the requested profiles: $($rule.DisplayName) (was $($priorProfile -join ', '))"
+        } else {
+            $scopeNow = if ($narrowedProfile) { $narrowedProfile -join ', ' } else { $priorProfile -join ', ' }
+            Write-Host "  Narrowed existing WinRM exception: $($rule.DisplayName) (was $($priorAddress -join ', ') on $($priorProfile -join ', '); now $($RemoteAddress -join ', ') on $scopeNow)"
+        }
     }
 
     # Carry a rule this script owns so -Disable has something unambiguous to
@@ -416,7 +465,16 @@ function Disable-DebuggeeRemoting {
 
             try {
                 Set-NetFirewallRule -Name $record.Name -RemoteAddress @($record.RemoteAddress)
-                Write-Host "  Restored WinRM exception scope: $($record.Name) ($(@($record.RemoteAddress) -join ', '))"
+
+                # Absent on records written before profile state was tracked.
+                if ($record.Profile) {
+                    Set-NetFirewallRule -Name $record.Name -Profile @($record.Profile)
+                }
+                if ($record.Enabled) {
+                    Set-NetFirewallRule -Name $record.Name -Enabled $record.Enabled
+                }
+
+                Write-Host "  Restored WinRM exception: $($record.Name) ($(@($record.RemoteAddress) -join ', ')$(if ($record.Profile) { " on $(@($record.Profile) -join ', ')" }))"
             } catch {
                 Write-Warning "  Could not restore '$($record.Name)': $($_.Exception.Message)"
             }
@@ -547,10 +605,9 @@ if ($PSCmdlet.ShouldProcess("BCD kernel debugging", "Enable debugging and config
     if ($remotingWarning) {
         Write-Host ""
         Write-Host "Host access needs another pass ($remotingWarning)"
-        Write-Host "Run this in the VM as Administrator:"
-        Write-Host "  Enable-PSRemoting -Force -SkipNetworkProfileCheck"
-        Write-Host "  New-NetFirewallRule -Name '$WinRmRuleId' -DisplayName '$WinRmRuleName' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $WinRmPort -RemoteAddress $($WinRmRemoteAddress -join ',') -Profile $($WinRmFirewallProfile -join ',')"
-        Write-Host "  New-ItemProperty -Path '$PolicyKeyPath' -Name $TokenFilterPolicyName -Value 1 -PropertyType DWord -Force"
+        Write-Host "Rerun this script with the same arguments once the cause is fixed; the remoting step is idempotent."
+        Write-Host "Configuring WinRM by hand instead would skip the rescoping of the exceptions Enable-PSRemoting"
+        Write-Host "creates, leaving port $WinRmPort open wider than -WinRmRemoteAddress and -WinRmFirewallProfile say."
     } elseif (-not $SkipRemoting) {
         Write-Host ""
         Write-Host "WinRM access:"
