@@ -1,0 +1,90 @@
+name: CodeQL (Swift)
+
+# Swift analysis costs roughly 22 minutes, and essentially all of it is the
+# `swift build` step: the build runs under the CodeQL tracer, whose extractor
+# walks the full transitive declaration surface of every imported module. vmctl
+# imports AppKit and Virtualization, so that surface is most of the macOS SDK --
+# ~545k extracted AST nodes for ~1.3k lines of source. The macOS runner (the
+# only tier CodeQL supports for Swift) makes it slower still.
+#
+# Almost no change in this repository touches Swift, so only run it when Swift
+# actually changed. Scheduled and manually dispatched runs ignore `paths` and
+# stay full scans.
+#
+# Note: a workflow skipped by a paths filter leaves its check-runs Pending
+# rather than reporting Success. That is fine while "Analyze (swift)" is not a
+# required status check on main. If it is ever made required, a PR that touches
+# no Swift will sit forever waiting on this check -- at which point either drop
+# it from the required list or gate the job with a job-level `if:` instead,
+# since skipped jobs do report Success.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "macos/Sources/**"
+      - "macos/Package.swift"
+      - "macos/Package.resolved"
+      - ".github/workflows/codeql-swift.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "macos/Sources/**"
+      - "macos/Package.swift"
+      - "macos/Package.resolved"
+      - ".github/workflows/codeql-swift.yml"
+  schedule:
+    - cron: "27 3 * * 1"
+  workflow_dispatch:
+
+# Least-privilege default; the analyze job elevates only what CodeQL needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-swift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    # Keep this job name stable. It is the check-run name branch protection
+    # matches required status checks against, and it is unchanged from when
+    # both languages shared one matrix workflow.
+    name: Analyze (swift)
+    runs-on: macos-latest
+    # security-events: write lets github/codeql-action/analyze upload SARIF
+    # results to code scanning; the rest stay read-only.
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        # Pinned to a commit SHA per GitHub's supply-chain guidance for
+        # third-party actions. The CodeQL actions below intentionally stay on
+        # the @v4 major tag, as GitHub recommends for codeql-action.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # No step pushes, so don't persist the token for later steps.
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          # The Swift package is under macos/ and must be built for extraction.
+          languages: swift
+          build-mode: manual
+
+      # Autobuild is unreliable here, so drive the build explicitly (this is
+      # the "manual build command" GitHub recommends over autobuild).
+      #
+      # Do NOT add a cache for macos/.build to speed this up. An incremental
+      # build skips compilation, the CodeQL tracer then observes no compiler
+      # invocations, and the database comes out empty -- a green check that
+      # analyzed nothing.
+      - name: Build Swift package
+        run: swift build --package-path macos
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:swift"
