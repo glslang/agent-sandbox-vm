@@ -171,7 +171,14 @@ $body = '{"model":"gemma3:1b","prompt":"why is the sky blue?","stream":false}'
 (Invoke-RestMethod http://127.0.0.1:11434/api/generate -Method Post -Body $body).response
 ```
 
-Size the model to the VM, not to your host. The sandbox is created with 4 GB of RAM, so a model needs to fit in roughly 3 GB alongside the toolchain — 1B–4B parameter models at default quantization are the realistic range. Larger models either swap badly or fail to load. Give the VM more memory (`Set-VMMemory`) before reaching for a bigger one, and remember every pulled model also consumes VHDX space.
+Size the model to the VM, not to your host. The sandbox uses dynamic memory that grows on demand between 2 GB and a **4 GB ceiling** (`New-AgentVM.ps1` sets `-MaximumBytes 4GB`), and it is that ceiling — not the current allocation — that caps model size: a model has to fit in roughly 3 GB alongside the toolchain, which puts 1B–4B parameter models at default quantization in range. Larger models either swap badly or fail to load. Raise the ceiling before reaching for a bigger one:
+
+```powershell
+# on the host, with the VM shut down
+Set-VMMemory -VMName AgentDevSandbox -MaximumBytes 8GB
+```
+
+Every pulled model also consumes VHDX space, which counts against the 80 GB disk.
 
 ### Kernel debugging
 
