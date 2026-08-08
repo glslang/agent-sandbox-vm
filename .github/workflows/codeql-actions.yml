@@ -1,4 +1,4 @@
-name: CodeQL
+name: CodeQL (Actions)
 
 on:
   push:
@@ -7,39 +7,29 @@ on:
     branches: [main]
   schedule:
     - cron: "27 3 * * 1"
+  workflow_dispatch:
 
 # Least-privilege default; the analyze job elevates only what CodeQL needs.
 permissions:
   contents: read
 
 concurrency:
-  group: codeql-${{ github.ref }}
+  group: codeql-actions-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   analyze:
-    name: Analyze (${{ matrix.language }})
-    runs-on: ${{ matrix.runner }}
+    # Keep this job name stable. It is the check-run name that branch
+    # protection matches required status checks against, and it is unchanged
+    # from when both languages shared one matrix workflow.
+    name: Analyze (actions)
+    runs-on: ubuntu-latest
     # security-events: write lets github/codeql-action/analyze upload SARIF
     # results to code scanning; the rest stay read-only.
     permissions:
       security-events: write
       actions: read
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # GitHub Actions workflows need no build.
-          - language: actions
-            build-mode: none
-            runner: ubuntu-latest
-          # The Swift package is under macos/ and must be built for extraction.
-          # Autobuild is unreliable here, so drive the build explicitly (this is
-          # the "manual build command" GitHub recommends over autobuild).
-          - language: swift
-            build-mode: manual
-            runner: macos-latest
     steps:
       - name: Checkout
         # Pinned to a commit SHA per GitHub's supply-chain guidance for
@@ -53,14 +43,11 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
-
-      - name: Build Swift package
-        if: matrix.build-mode == 'manual'
-        run: swift build --package-path macos
+          # GitHub Actions workflows need no build.
+          languages: actions
+          build-mode: none
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
-          category: "/language:${{ matrix.language }}"
+          category: "/language:actions"
