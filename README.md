@@ -206,6 +206,18 @@ powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebuggee.ps1 -Debu
 
 This also enables test signing (`bcdedit /set testsigning on`) so test-signed drivers can load on the debuggee. Pass `-SkipTestSigning` to leave test signing untouched.
 
+The same run opens host access so binaries can be copied onto the debuggee: it enables PowerShell remoting, adds an inbound WinRM firewall rule (`Agent Sandbox Debuggee WinRM`, TCP 5985), and sets `LocalAccountTokenFilterPolicy` to 1 so a local admin account keeps its elevated token over the network. The rule defaults to `LocalSubnet` on every firewall profile, since a Hyper-V internal switch is usually classified Public; narrow it with `-WinRmRemoteAddress <debugger-ip>` and `-WinRmFirewallProfile Private`. `-WinRmPort` only points the rule at another port (5986 if you configured an HTTPS listener yourself); the script does not create listeners beyond the HTTP one `Enable-PSRemoting` sets up. Pass `-SkipRemoting` to leave remoting configuration untouched.
+
+From the debugger host, copy test binaries in with:
+
+```powershell
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value <debuggee-ip> -Concatenate -Force
+$session = New-PSSession -ComputerName <debuggee-ip> -Credential (Get-Credential)
+Copy-Item -ToSession $session C:\build\driver.sys -Destination C:\workspace\
+```
+
+If KDNET claims the debuggee's only network adapter and guest networking stops working, add a second network adapter for WinRM, or copy over PowerShell Direct from the Hyper-V host (`New-PSSession -VMName <vm-name>`), which needs no guest network.
+
 Reboot the debuggee VM, then start WinDbg on the debugger machine with the command printed by `Setup-KernelDebugger.ps1`:
 
 ```powershell
@@ -219,6 +231,8 @@ powershell -ExecutionPolicy RemoteSigned -File C:\Setup-KernelDebuggee.ps1 -Disa
 ```
 
 Pass `-SkipTestSigning` on the disable path too to turn off kernel debugging while leaving the current test-signing boot policy unchanged (for example, when test signing was enabled independently of this script).
+
+The disable path also removes the WinRM firewall rule and the `LocalAccountTokenFilterPolicy` value, leaving WinRM itself running because provisioned sandbox VMs enable it during provisioning. Pass `-SkipRemoting` to leave both in place.
 
 After the debuggee VM shuts down, Secure Boot can be restored on the Hyper-V host:
 
