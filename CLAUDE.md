@@ -149,7 +149,7 @@ Credentials are stored per VM as encrypted `vm-cred.xml` files (only readable by
 - TTD command line utility (`Microsoft.TimeTravelDebugging` via winget)
 - Claude Code (`@anthropic-ai/claude-code`) authenticated via OAuth
 - OpenAI Codex CLI (`@openai/codex` via npm)
-- [Ollama](https://docs.ollama.com/quickstart) (`Ollama.Ollama` via winget) — local model runtime serving `127.0.0.1:11434`. Installed with no models: `ollama pull <model>` needs internet, but a model pulled before `Save-BaseSnapshot.ps1` is available in fully isolated sessions. The VM's 4 GB RAM caps this at roughly 1B–4B parameter models.
+- [Ollama](https://docs.ollama.com/quickstart) (`Ollama.Ollama` via winget) — local model runtime serving `127.0.0.1:11434`. Installed with no models: `ollama pull <model>` needs internet, but a model pulled before `Save-BaseSnapshot.ps1` is available in fully isolated sessions. The VM's dynamic-memory ceiling (`-MaximumBytes 4GB`) caps this at roughly 1B–4B parameter models; raise it with `Set-VMMemory` for anything larger.
 
 ## macOS Host (Experimental)
 

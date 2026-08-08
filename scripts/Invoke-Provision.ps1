@@ -103,28 +103,44 @@ function Wait-OllamaServer {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $launched = $false
+    $lastError = ""
 
     while ((Get-Date) -lt $deadline) {
         try {
             Invoke-WebRequest -Uri "http://127.0.0.1:11434/api/version" -UseBasicParsing -TimeoutSec 3 | Out-Null
             return $true
         } catch {
-            # Not listening yet.
+            # Expected while the server is still coming up. Keep the message so
+            # a genuine local failure is distinguishable from "not listening
+            # yet" when the timeout is reported.
+            $lastError = $_.Exception.Message
         }
 
         if (-not $launched) {
             # Prefer the tray app: it is what the login entry runs, so the
             # server behaves the same here as it will after every reboot.
             $ollamaApp = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama app.exe"
-            if (Test-Path $ollamaApp) {
-                Start-Process -FilePath $ollamaApp | Out-Null
-            } else {
-                Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden | Out-Null
+            try {
+                if (Test-Path $ollamaApp) {
+                    Start-Process -FilePath $ollamaApp | Out-Null
+                } else {
+                    Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden | Out-Null
+                }
+            } catch {
+                # A server we cannot launch is a warning, not a failed
+                # provision -- but $ErrorActionPreference = "Stop" would make
+                # this throw all the way out and abort the run, so stop here.
+                Write-Warning "  Could not launch the Ollama server: $($_.Exception.Message)"
+                return $false
             }
             $launched = $true
         }
 
         Start-Sleep -Seconds 3
+    }
+
+    if ($lastError) {
+        Write-Warning "  Last error while polling the Ollama server: $lastError"
     }
 
     return $false
