@@ -288,10 +288,7 @@ scripted rather than described:
   On the way back out it restores a rule only where that rule is still exactly as this script left
   it; one an administrator has since disabled or tightened is left to them, since reinstating a
   broad original over it would hand out access at the moment the script is taking its own away.
-  That check compares against the *latest* run rather than the first, so neither a rerun that
-  narrows a rule further nor a `-Disable` that got half way through restoring one is later mistaken
-  for somebody else's edit: the original scope on file stays the machine's own throughout, and a
-  partial restore can simply be run again.
+  That is rule 3 of the ledger below, and rule 2 is what keeps it honest across reruns and retries.
   A rule counts as being on that port whether its filter names the port exactly or a range spanning
   it, and a rule that cannot be narrowed -- one managed by group policy, typically -- fails the run
   rather than letting it report a boundary the rule still overrides. One whose filter is `LocalPort Any` is never
@@ -317,12 +314,12 @@ scripted rather than described:
   anywhere; it is just a login that never authenticates. The key is appended to that file, never
   written over it, so other keys and comments in it survive -- including the file's exact ending: if
   its last line had no terminator, the newline this script inserts to keep the new key off that line
-  is recorded and taken back out by `-Disable`, so the file comes back byte for byte. Keys are
-  matched the way sshd reads them, on the type and the base64 blob rather than the whole line, so a
-  comment edited by hand afterwards neither hides the key from `-Disable` nor gets it installed a
-  second time by a rerun; a key that has genuinely gone is reported as not found rather than
-  reported removed. A file starting with a byte-order mark
-  is refused instead -- sshd reads it as plain bytes, so a UTF-16 file (what Windows PowerShell
+  is a ledger entry of its own, taken back out once every managed key has left the file, so the file
+  comes back byte for byte however many runs appended to it. Keys are matched the way sshd reads
+  them, on the type and the base64 blob, and the type is *found* rather than assumed to be the first
+  field -- so neither a comment edited by hand nor an entry hardened with `restrict` or `from="..."`
+  hides a key from `-Disable`, and neither gets it installed a second time by a rerun. A file
+  starting with a byte-order mark is refused instead -- sshd reads it as plain bytes, so a UTF-16 file (what Windows PowerShell
   redirection writes by default) is already not being read the way it looks. Membership is resolved
   through nested
   groups, since sshd reads it off the logon token. Where it cannot be resolved -- a domain group in
@@ -351,6 +348,9 @@ Windows OpenSSH hands a member of the Administrators group a full, unfiltered to
 elevation-only tools do work over this. That is the host's logon policy rather than a guarantee, and
 the printed summary includes the one-line check.
 
+The printed `~/.ssh/config` escapes what it quotes, so a client identity path containing a double
+quote or a backslash survives ssh's parser rather than producing a config it refuses.
+
 `-SshHostAlias` may not contain whitespace: ssh refuses a destination with a space in it whatever the
 quoting, so such an alias could never be connected to. A `-User` with a space is fine -- the printed
 `~/.ssh/config` quotes it, which the real parser accepts.
@@ -365,23 +365,38 @@ To close it again:
 powershell -ExecutionPolicy RemoteSigned -File C:\Setup-RemoteMcp.ps1 -Disable
 ```
 
-Prior scope, profile, and enabled state of every rule it touched, the previous default shell, the
-sshd startup type and running state, the DACL of every authorized-keys file it rebuilt, and the keys
-it installed go to
-`C:\ProgramData\agent-sandbox\remote-mcp-ssh.json` so `-Disable` puts them back exactly. Rerunning
+Every change goes into one ledger in `C:\ProgramData\agent-sandbox\remote-mcp-ssh.json` -- a
+competing firewall rule's scope, profile and enabled state; the previous default shell and its
+command option; the sshd startup type and running state; the DACL of every authorized-keys file
+rebuilt; each key installed; and the newline added to a file that had none. One entry per change,
+carrying what the machine had (`Original`) and what this script wrote (`Applied`), under one set of
+rules for all of them rather than a separate implementation per component:
+
+1. **Record before mutating.** A change made and not written down is one `-Disable` can never put
+   back.
+2. **Track what was applied, not what was planned.** `Applied` starts equal to `Original` and
+   advances only as each individual write returns, so it describes the machine as the script
+   actually left it -- however far through a multi-field change it got.
+3. **Verify before reverting.** A field goes back only where the machine still holds the value this
+   script wrote; anything else belongs to whoever changed it since.
+4. **Drop what is restored, keep what is not.** What stays on record is exactly the work still
+   outstanding, so a later `-Disable` resumes rather than re-applies.
+
+Restore order comes from the entry kind, and within one file the lower kind goes first -- which is
+what puts a key out before that file's terminator, and both before the DACL protecting them. Rerunning
 enable never overwrites that record, and a run that fails part way still records what it had already
 changed -- a machine left modified with nothing written down is one `-Disable` cannot help, so a run
 that changes the machine and then cannot write the record fails rather than reporting success. A record
 that exists but cannot be parsed stops the run before it changes anything, rather than being taken
 for no record at all: restore or move the file and rerun.
 
-The record also tracks *which* components the script actually wrote, so `-Disable` only reverts
-those: after an enable with `-SkipDefaultShell`, it leaves a `DefaultShell` someone else configured
-alone rather than deleting it. It also checks before reverting the shell that the value sitting
-there is still the one this script wrote, since a record can outlive the change it describes. And it survives a `-Disable` that could not finish -- a firewall rule
-held by group policy, a `-Skip` switch -- so a later run can pick up where that one stopped; the run
-says what is still outstanding. What that run *did* put back is dropped from the record rather than
-carried, so a later `-Disable` cannot re-apply a value from before the first enable over whatever was
+The ledger holds only what the script actually wrote, so `-Disable` reverts only that: after an
+enable with `-SkipDefaultShell` it leaves a `DefaultShell` someone else configured alone, and a rule
+already inside the requested scope is never recorded at all. Rule 3 applies to every kind alike --
+a shell, a firewall rule, the sshd service and a DACL each stay put if somebody changed them after
+setup, and the run names the field that moved. Rule 4 is what makes a `-Disable` that could not
+finish -- a firewall rule held by group policy, a `-Skip` switch -- resumable: a later run picks up
+where that one stopped and cannot re-apply a value from before the first enable over whatever was
 configured in the meantime.
 
 `-Disable` leaves the OpenSSH capability and its host keys installed, because removing them would
