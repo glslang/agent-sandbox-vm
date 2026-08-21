@@ -118,6 +118,11 @@ $SystemSid = "S-1-5-18"
 # found it instead of guessing at defaults.
 $StatePath = Join-Path $env:ProgramData "agent-sandbox\remote-mcp-ssh.json"
 
+# What -Disable did not put back this run, whether because a restore failed or
+# because a -Skip switch held it back. Any entry keeps the state file: a record
+# discarded while the machine is still changed cannot be retried.
+$script:UnfinishedRestore = @()
+
 function Invoke-NativeCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -516,7 +521,16 @@ function Enable-RemoteMcpFirewall {
         [string[]]$RemoteAddress,
 
         [Parameter(Mandatory = $true)]
-        [string[]]$FirewallProfile
+        [string[]]$FirewallProfile,
+
+        # Filled in as each rule is narrowed rather than returned at the end,
+        # so a failure creating this script's own rule below cannot lose the
+        # record of the exceptions already changed.
+        # AllowEmptyCollection because a mandatory parameter otherwise refuses
+        # an empty one -- which is exactly what the first run passes.
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.ArrayList]$AdjustedRule
     )
 
     # 22 stays in scope even when -Port names another one, because the
@@ -524,7 +538,6 @@ function Enable-RemoteMcpFirewall {
     # default port open wider than -ClientAddress says.
     $scopedPorts = @(@($Port, 22) | Select-Object -Unique)
 
-    $adjustedRules = @()
     foreach ($rule in Get-CompetingSshRule -Port $scopedPorts) {
         $priorAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
         $priorProfile = @("$($rule.Profile)" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -563,12 +576,12 @@ function Enable-RemoteMcpFirewall {
             continue
         }
 
-        $adjustedRules += [pscustomobject]@{
+        [void]$AdjustedRule.Add([pscustomobject]@{
             Name          = $rule.Name
             RemoteAddress = $priorAddress
             Profile       = $priorProfile
             Enabled       = $priorEnabled
-        }
+        })
 
         if ($disableRule) {
             Write-Host "  Disabled existing SSH exception outside the requested profiles: $($rule.DisplayName) (was $($priorProfile -join ', '))"
@@ -622,8 +635,52 @@ function Enable-RemoteMcpFirewall {
 
         Write-Host "  Firewall rule created: $SshRuleName"
     }
+}
 
-    $adjustedRules
+function Save-EnableState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Mutation
+    )
+
+    # Only the first run to touch a component sees the machine's original
+    # setting for it. A rerun must not overwrite that with a value this script
+    # already wrote, or -Disable would restore this script's configuration
+    # instead of the machine's.
+    $state = Get-RemoteMcpState
+
+    if (-not $state) {
+        Save-RemoteMcpState -State ([ordered]@{
+            DefaultShell        = $Mutation.DefaultShell
+            DefaultShellManaged = $Mutation.DefaultShellManaged
+            SshStartType        = $Mutation.SshStartType
+            SshWasRunning       = $Mutation.SshWasRunning
+            CapabilityInstalled = $Mutation.CapabilityInstalled
+            AdjustedRules       = @($Mutation.AdjustedRules)
+            AuthorizedKeys      = @($Mutation.AuthorizedKeys)
+        })
+
+        return
+    }
+
+    $knownRules = @(@($state.AdjustedRules) | ForEach-Object { $_.Name })
+    $knownKeys = @(@($state.AuthorizedKeys) | ForEach-Object { "$($_.Path)|$($_.Key)" })
+
+    # A stored value for a component an earlier run never touched is not an
+    # original worth protecting: if that run skipped the default shell, or died
+    # before reaching the service, what THIS run found is the machine's own.
+    $defaultShell = if ($state.DefaultShellManaged) { $state.DefaultShell } else { $Mutation.DefaultShell }
+    $serviceKnown = $null -ne $state.SshStartType
+
+    Save-RemoteMcpState -State ([ordered]@{
+        DefaultShell        = $defaultShell
+        DefaultShellManaged = ([bool]$state.DefaultShellManaged -or $Mutation.DefaultShellManaged)
+        SshStartType        = $(if ($serviceKnown) { $state.SshStartType } else { $Mutation.SshStartType })
+        SshWasRunning       = $(if ($serviceKnown) { $state.SshWasRunning } else { $Mutation.SshWasRunning })
+        CapabilityInstalled = ([bool]$state.CapabilityInstalled -or $Mutation.CapabilityInstalled)
+        AdjustedRules       = @(@($state.AdjustedRules) + @($Mutation.AdjustedRules | Where-Object { $knownRules -notcontains $_.Name }))
+        AuthorizedKeys      = @(@($state.AuthorizedKeys) + @($Mutation.AuthorizedKeys | Where-Object { $knownKeys -notcontains "$($_.Path)|$($_.Key)" }))
+    })
 }
 
 function Disable-RemoteMcpFirewall {
@@ -664,6 +721,7 @@ function Disable-RemoteMcpFirewall {
             Write-Host "  Restored SSH exception: $($record.Name) ($(@($record.RemoteAddress) -join ', ')$(if ($record.Profile) { " on $(@($record.Profile) -join ', ')" }))"
         } catch {
             Write-Warning "  Could not restore '$($record.Name)': $($_.Exception.Message)"
+            $script:UnfinishedRestore += "firewall rule $($record.Name)"
         }
     }
 }
@@ -695,6 +753,7 @@ function Restore-SshService {
         }
     } catch {
         Write-Warning "  Could not restore the sshd service: $($_.Exception.Message)"
+        $script:UnfinishedRestore += "the sshd service"
     }
 }
 
@@ -742,20 +801,33 @@ if ($Disable) {
 
     if ($SkipFirewall) {
         Write-Host "  Skipped firewall changes (-SkipFirewall specified)."
+        $script:UnfinishedRestore += "the firewall (-SkipFirewall)"
     } else {
         Disable-RemoteMcpFirewall -State $state
     }
 
     if ($SkipDefaultShell) {
         Write-Host "  Skipped default shell (-SkipDefaultShell specified)."
-    } elseif ($state) {
-        Restore-SshDefaultShell -Value $state.DefaultShell
-    } else {
+        $script:UnfinishedRestore += "the default shell (-SkipDefaultShell)"
+    } elseif (-not $state) {
         Write-Host "  No saved state; default shell left alone."
+    } elseif (-not $state.DefaultShellManaged) {
+        # This script never wrote the value, so there is no evidence it owns
+        # the one that is there now. Deleting it would silently undo a shell
+        # configured independently.
+        Write-Host "  Default shell was not set by this script; left alone."
+    } else {
+        try {
+            Restore-SshDefaultShell -Value $state.DefaultShell
+        } catch {
+            Write-Warning "  Could not restore the default shell: $($_.Exception.Message)"
+            $script:UnfinishedRestore += "the default shell"
+        }
     }
 
     if ($SkipKeys) {
         Write-Host "  Left installed keys in place (-SkipKeys specified)."
+        $script:UnfinishedRestore += "the installed keys (-SkipKeys)"
     } elseif ($state) {
         $records = @(@($state.AuthorizedKeys) | Where-Object { $_ })
         if ($records.Count -eq 0) {
@@ -767,6 +839,7 @@ if ($Disable) {
                 Remove-AuthorizedKey -Path $record.Path -Key $record.Key
             } catch {
                 Write-Warning "  Could not remove key from '$($record.Path)': $($_.Exception.Message)"
+                $script:UnfinishedRestore += "key in $($record.Path)"
             }
         }
     } else {
@@ -776,7 +849,16 @@ if ($Disable) {
     Restore-SshService -State $state
 
     if ($state) {
-        Remove-Item -Path $StatePath -Force
+        # The record is the only way back for anything still changed, and a
+        # failure here is usually transient -- a group-policy rule, a service
+        # mid-transition. Keep it so a later -Disable can pick up where this
+        # one stopped; every step above is idempotent.
+        if ($script:UnfinishedRestore.Count -gt 0) {
+            Write-Host ""
+            Write-Warning "Kept $StatePath -- not put back: $($script:UnfinishedRestore -join '; '). Rerun -Disable once the cause is fixed."
+        } else {
+            Remove-Item -Path $StatePath -Force
+        }
     }
 
     Write-Host ""
@@ -794,38 +876,10 @@ if ($ServerCommand -and -not (Test-Path $ServerCommand)) {
     Write-Warning "No file at -ServerCommand '$ServerCommand'. The client registration below is printed anyway; copy the server in before using it."
 }
 
-if (-not $PSCmdlet.ShouldProcess("OpenSSH server", "Open remote MCP access over ssh")) {
-    Write-Host "Remote MCP setup was not applied."
-    exit 0
-}
-
-Write-Host "[1/4] OpenSSH Server:"
-$capabilityInstalled = Install-OpenSshServer
-$priorService = Start-SshService
-
-Write-Host ""
-Write-Host "[2/4] Firewall:"
-$adjustedRules = @()
-if ($SkipFirewall) {
-    Write-Host "  Skipped (-SkipFirewall specified)."
-} else {
-    $adjustedRules = @(Enable-RemoteMcpFirewall `
-        -Port $Port `
-        -RemoteAddress $ClientAddress `
-        -FirewallProfile $FirewallProfile)
-}
-
-Write-Host ""
-Write-Host "[3/4] Default shell:"
-$priorDefaultShell = $null
-if ($SkipDefaultShell) {
-    Write-Host "  Skipped (-SkipDefaultShell specified). An MCP transport needs cmd.exe here; PowerShell rewrites the stream."
-} else {
-    $priorDefaultShell = Set-SshDefaultShell
-}
-
-Write-Host ""
-Write-Host "[4/4] Authorized key:"
+# Resolved before anything is changed. Both of these throw on an account that
+# does not exist or has never signed in, and doing that after sshd, the
+# firewall and the default shell had been altered would leave a machine this
+# script had changed with nothing recorded to change back.
 $userSid = Get-UserSid -Name $User
 $userIsAdministrator = Test-UserIsAdministrator -Name $User -Sid $userSid
 
@@ -839,51 +893,83 @@ $authorizedKeysPath = if ($userIsAdministrator) {
     Join-Path (Get-UserProfilePath -Name $User -Sid $userSid) ".ssh\authorized_keys"
 }
 
-$installedKeys = @()
-if (-not $resolvedKey) {
-    Write-Host "  No key given (-PublicKey / -PublicKeyPath). sshd will read:"
-    Write-Host "    $authorizedKeysPath"
-    Write-Host "  Put the client's public key there, then rerun this script so the ACL is set."
-} else {
-    $keyDir = Split-Path -Path $authorizedKeysPath -Parent
-    if (-not (Test-Path $keyDir)) {
-        New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
-    }
-
-    $added = Add-AuthorizedKey -Path $authorizedKeysPath -Key $resolvedKey
-    Set-AuthorizedKeysAcl -Path $authorizedKeysPath -IsAdministratorsFile $userIsAdministrator -OwnerSid $userSid
-    Write-Host "  ACL tightened on $authorizedKeysPath"
-
-    if ($added) {
-        $installedKeys = @([pscustomobject]@{ Path = $authorizedKeysPath; Key = $resolvedKey })
-    }
+if (-not $PSCmdlet.ShouldProcess("OpenSSH server", "Open remote MCP access over ssh")) {
+    Write-Host "Remote MCP setup was not applied."
+    exit 0
 }
 
-# Only the first run sees the machine's original settings. A rerun must not
-# overwrite that record with values this script already changed, or -Disable
-# would restore its own configuration instead of the machine's.
-$state = Get-RemoteMcpState
-if ($state) {
-    $knownRules = @(@($state.AdjustedRules) | ForEach-Object { $_.Name })
-    $knownKeys = @(@($state.AuthorizedKeys) | ForEach-Object { "$($_.Path)|$($_.Key)" })
+# Filled in step by step below and persisted in the finally, so a run that
+# throws half way still leaves -Disable able to put back what it did change.
+# Recording nothing would strand the machine: the next enable would capture the
+# already-modified firewall scope and default shell as the originals.
+$mutation = [ordered]@{
+    DefaultShell        = $null
+    DefaultShellManaged = $false
+    SshStartType        = $null
+    SshWasRunning       = $null
+    CapabilityInstalled = $false
+    AdjustedRules       = New-Object System.Collections.ArrayList
+    AuthorizedKeys      = New-Object System.Collections.ArrayList
+}
 
-    Save-RemoteMcpState -State ([ordered]@{
-        DefaultShell        = $state.DefaultShell
-        SshStartType        = $state.SshStartType
-        SshWasRunning       = $state.SshWasRunning
-        CapabilityInstalled = ([bool]$state.CapabilityInstalled -or $capabilityInstalled)
-        AdjustedRules       = @(@($state.AdjustedRules) + @($adjustedRules | Where-Object { $knownRules -notcontains $_.Name }))
-        AuthorizedKeys      = @(@($state.AuthorizedKeys) + @($installedKeys | Where-Object { $knownKeys -notcontains "$($_.Path)|$($_.Key)" }))
-    })
-} else {
-    Save-RemoteMcpState -State ([ordered]@{
-        DefaultShell        = $priorDefaultShell
-        SshStartType        = $priorService.StartType
-        SshWasRunning       = $priorService.WasRunning
-        CapabilityInstalled = $capabilityInstalled
-        AdjustedRules       = @($adjustedRules)
-        AuthorizedKeys      = @($installedKeys)
-    })
+try {
+    Write-Host "[1/4] OpenSSH Server:"
+    $mutation.CapabilityInstalled = Install-OpenSshServer
+    $priorService = Start-SshService
+    $mutation.SshStartType = $priorService.StartType
+    $mutation.SshWasRunning = $priorService.WasRunning
+
+    Write-Host ""
+    Write-Host "[2/4] Firewall:"
+    if ($SkipFirewall) {
+        Write-Host "  Skipped (-SkipFirewall specified)."
+    } else {
+        Enable-RemoteMcpFirewall `
+            -Port $Port `
+            -RemoteAddress $ClientAddress `
+            -FirewallProfile $FirewallProfile `
+            -AdjustedRule $mutation.AdjustedRules
+    }
+
+    Write-Host ""
+    Write-Host "[3/4] Default shell:"
+    if ($SkipDefaultShell) {
+        # Deliberately leaves DefaultShellManaged false: a value this script
+        # never wrote is not one -Disable may delete.
+        Write-Host "  Skipped (-SkipDefaultShell specified). An MCP transport needs cmd.exe here; PowerShell rewrites the stream."
+    } else {
+        $mutation.DefaultShell = Set-SshDefaultShell
+        $mutation.DefaultShellManaged = $true
+    }
+
+    Write-Host ""
+    Write-Host "[4/4] Authorized key:"
+    if (-not $resolvedKey) {
+        Write-Host "  No key given (-PublicKey / -PublicKeyPath). sshd will read:"
+        Write-Host "    $authorizedKeysPath"
+        Write-Host "  Put the client's public key there, then rerun this script so the ACL is set."
+    } else {
+        $keyDir = Split-Path -Path $authorizedKeysPath -Parent
+        if (-not (Test-Path $keyDir)) {
+            New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
+        }
+
+        # Recorded before the ACL call, which can throw with the key already on
+        # disk -- a key installed and not recorded is one -Disable never removes.
+        if (Add-AuthorizedKey -Path $authorizedKeysPath -Key $resolvedKey) {
+            [void]$mutation.AuthorizedKeys.Add([pscustomobject]@{ Path = $authorizedKeysPath; Key = $resolvedKey })
+        }
+
+        Set-AuthorizedKeysAcl -Path $authorizedKeysPath -IsAdministratorsFile $userIsAdministrator -OwnerSid $userSid
+        Write-Host "  ACL tightened on $authorizedKeysPath"
+    }
+} finally {
+    # Never let a failure here replace the exception that got us here.
+    try {
+        Save-EnableState -Mutation $mutation
+    } catch {
+        Write-Warning "Could not record what this run changed to $StatePath ($($_.Exception.Message)); -Disable will not be able to put it back."
+    }
 }
 
 Write-Host ""
