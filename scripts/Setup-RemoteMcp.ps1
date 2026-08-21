@@ -1122,11 +1122,20 @@ function Enable-RemoteMcpFirewall {
         # profile or the enabled flag -- and the second throwing with the first
         # applied would otherwise leave the rule changed with its original
         # address written down nowhere.
+        # Both halves: what the rule was, and what this run is about to make
+        # it. -Disable needs the second to tell whether the rule it finds later
+        # is still the one this script left, or something an administrator has
+        # since changed -- putting a broad, enabled original back over a rule
+        # somebody deliberately tightened would hand out access at the very
+        # moment this script is taking its own away.
         [void]$AdjustedRule.Add([pscustomobject]@{
-            Name          = $rule.Name
-            RemoteAddress = $priorAddress
-            Profile       = $priorProfile
-            Enabled       = $priorEnabled
+            Name                 = $rule.Name
+            RemoteAddress        = $priorAddress
+            Profile              = $priorProfile
+            Enabled              = $priorEnabled
+            AppliedRemoteAddress = $(if ($narrowedAddress) { @($narrowedAddress) } else { $priorAddress })
+            AppliedProfile       = $(if ($narrowedProfile) { @($narrowedProfile) } else { $priorProfile })
+            AppliedEnabled       = $(if ($disableRule) { "False" } else { $priorEnabled })
         })
 
         try {
@@ -1280,6 +1289,45 @@ function Save-EnableState {
     })
 }
 
+function Test-RuleStillAsApplied {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Record
+    )
+
+    # A record written before this check existed cannot be verified; restoring
+    # is the contract it was written under.
+    if (-not $Record.AppliedEnabled) {
+        return $true
+    }
+
+    $rule = Get-NetFirewallRule -Name $Record.Name -ErrorAction SilentlyContinue
+    if (-not $rule) {
+        # Gone entirely. There is nothing to put back, and recreating it is not
+        # this script's business.
+        return $false
+    }
+
+    if ("$($rule.Enabled)" -ne "$($Record.AppliedEnabled)") {
+        return $false
+    }
+
+    $currentProfile = @("$($rule.Profile)" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $appliedProfile = @($Record.AppliedProfile)
+    if (@(Compare-Object -ReferenceObject $appliedProfile -DifferenceObject $currentProfile).Count -gt 0) {
+        return $false
+    }
+
+    try {
+        $currentAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
+    } catch {
+        return $false
+    }
+
+    $appliedAddress = @($Record.AppliedRemoteAddress)
+    @(Compare-Object -ReferenceObject $appliedAddress -DifferenceObject $currentAddress).Count -eq 0
+}
+
 function Disable-RemoteMcpFirewall {
     param(
         [Parameter(Mandatory = $true)]
@@ -1309,6 +1357,16 @@ function Disable-RemoteMcpFirewall {
 
     foreach ($record in @($State.AdjustedRules)) {
         if (-not $record) {
+            continue
+        }
+
+        # Only where the rule is still exactly as this run left it. Anything
+        # else means somebody has changed it since, and their version wins:
+        # this script relinquishes the rule rather than reinstating a scope
+        # that is no longer anyone's intent. Dropped from the record too --
+        # ownership has moved, so a later run should not keep trying.
+        if (-not (Test-RuleStillAsApplied -Record $record)) {
+            Write-Host "  Left alone, changed since this script narrowed it: $($record.Name)"
             continue
         }
 
@@ -1660,6 +1718,14 @@ if ($FirewallProfile -contains "Any" -and $FirewallProfile.Count -gt 1) {
     throw "Use -FirewallProfile Any by itself, or choose one or more of Domain, Private, Public."
 }
 
+# ssh will not take a destination containing whitespace -- it answers "hostname
+# contains invalid characters" before reading any config -- so no amount of
+# quoting in the block below would make such an alias usable. Refuse it here
+# rather than print a config naming a host nothing can connect to.
+if ($SshHostAlias -match "\s") {
+    throw "-SshHostAlias '$SshHostAlias' contains whitespace. ssh refuses a destination with a space in it whatever the quoting, so this alias could never be connected to. Use one without."
+}
+
 # Read before anything is changed. Get-RemoteMcpState throws on a record it
 # cannot parse, and this is where that has to happen: from inside the run it
 # would abort with the machine already half configured.
@@ -1849,6 +1915,7 @@ $sshHostName = if ($vmAddresses.Count -gt 0) { $vmAddresses[0] } else { "<vm-add
 # before ssh ever ran.
 $remoteCommand = if ($ServerCommand) { $ServerCommand } else { "<path-to-mcp-server.exe>" }
 $remoteCommandArg = ConvertTo-PosixSingleQuoted -Value ('"' + $remoteCommand + '"')
+
 $portLine = if ($Port -ne 22) { "`n      Port $Port" } else { "" }
 $probeJson = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
 
@@ -1857,8 +1924,8 @@ Write-Host @"
 On the client, give this VM a stable name in ~/.ssh/config:
 
   Host $SshHostAlias
-      HostName $sshHostName
-      User $User$portLine
+      HostName "$sshHostName"
+      User "$User"$portLine
       IdentityFile "$ClientIdentityFile"
       RequestTTY no
       BatchMode yes
