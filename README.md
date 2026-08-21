@@ -330,7 +330,9 @@ sshd startup type and running state, the DACL of every authorized-keys file it r
 it installed go to
 `C:\ProgramData\agent-sandbox\remote-mcp-ssh.json` so `-Disable` puts them back exactly. Rerunning
 enable never overwrites that record, and a run that fails part way still records what it had already
-changed -- a machine left modified with nothing written down is one `-Disable` cannot help.
+changed -- a machine left modified with nothing written down is one `-Disable` cannot help. A record
+that exists but cannot be parsed stops the run before it changes anything, rather than being taken
+for no record at all: restore or move the file and rerun.
 
 The record also tracks *which* components the script actually wrote, so `-Disable` only reverts
 those: after an enable with `-SkipDefaultShell`, it leaves a `DefaultShell` someone else configured
