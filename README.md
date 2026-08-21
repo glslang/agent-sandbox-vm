@@ -314,8 +314,11 @@ scripted rather than described:
   anywhere; it is just a login that never authenticates. The key is appended to that file, never
   written over it, so other keys and comments in it survive -- including the file's exact ending: if
   its last line had no terminator, the newline this script inserts to keep the new key off that line
-  is a ledger entry of its own, taken back out once every managed key has left the file, so the file
-  comes back byte for byte however many runs appended to it. Keys are matched the way sshd reads
+  is a ledger entry of its own, recorded by position rather than as "the last byte", and taken back
+  out once every managed key has left the file -- so the file comes back byte for byte however many
+  runs appended to it. If something else has appended a line since, that newline now terminates
+  somebody else's content: the run reports it as changed and leaves it, rather than joining two
+  lines that were never joined. Keys are matched the way sshd reads
   them, on the type and the base64 blob, and the type is *found* rather than assumed to be the first
   field -- so neither a comment edited by hand nor an entry hardened with `restrict` or `from="..."`
   hides a key from `-Disable`, and neither gets it installed a second time by a rerun. A file
@@ -380,10 +383,13 @@ rules for all of them rather than a separate implementation per component:
    the fields it actually wrote: one it merely looked at keeps whatever the earlier run recorded,
    so a value somebody else set in between is never mistaken for this script's own.
 3. **Verify before reverting.** A field goes back only where the machine still holds the value this
-   script wrote; anything else belongs to whoever changed it since. Ownership is per *field*, not
-   per component: an administrator who sets sshd to `Disabled` keeps that, while the service this
-   script started is still stopped. Only the default shell is all-or-nothing, because
-   `<shell> <option>` has to agree with itself.
+   script wrote; anything else belongs to whoever changed it since. Ownership is per *field* where
+   the fields stand alone: an administrator who sets sshd to `Disabled` keeps that, while the
+   service this script started is still stopped. Where they do not, the change is all-or-nothing --
+   the default shell, because `<shell> <option>` has to agree with itself, and a firewall rule,
+   because its address, profile and enabled flag are one scope. Giving a rule's address back while
+   somebody else owns its profile would produce a combination neither party configured. A rule left
+   narrower than this script found it is the safe failure there.
 4. **Drop what is restored, keep what is not.** What stays on record is exactly the work still
    outstanding, so a later `-Disable` resumes rather than re-applies.
 
@@ -391,7 +397,8 @@ Restore order comes from the entry kind, and within one file the lower kind goes
 what puts a key out before that file's terminator, and both before the DACL protecting them. The
 order is also the order a run that is *closing* access has to work in: sshd stops and the key comes
 out first, the firewall is handed back last, so `-Disable` never widens the machine while the
-credential it installed is still live. One consequence worth knowing: a `-Disable` run over the very
+credential it installed is still live. Enable runs the same way round: the firewall boundary is
+enforced *before* sshd is started, so the listener never answers from outside `-ClientAddress`. One consequence worth knowing: a `-Disable` run over the very
 ssh access it is closing loses its session part way through, so run it on the guest. Rerunning
 enable never overwrites that record, and a run that fails part way still records what it had already
 changed -- a machine left modified with nothing written down is one `-Disable` cannot help, so a run
