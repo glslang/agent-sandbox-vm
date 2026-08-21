@@ -113,6 +113,8 @@ $SshRuleId = "AgentSandbox-RemoteMcp-SSH"
 $SshRuleName = "Agent Sandbox Remote MCP SSH"
 $OpenSshKeyPath = "HKLM:\SOFTWARE\OpenSSH"
 $DefaultShellValueName = "DefaultShell"
+$DefaultShellCommandOptionValueName = "DefaultShellCommandOption"
+$CmdCommandOption = "/c"
 $CmdPath = Join-Path $env:SystemRoot "System32\cmd.exe"
 $SshProgramData = Join-Path $env:ProgramData "ssh"
 $AdministratorsKeyFile = Join-Path $SshProgramData "administrators_authorized_keys"
@@ -342,11 +344,16 @@ function Set-AuthorizedKeysAcl {
     # the audit entries are not touched, so restoring them is not this
     # script's business either. Recorded before the rebuild, like every other
     # change here, and only when there was something to record.
-    if ($FileExisted -and -not $Mutation.AuthorizedKeysAcl) {
-        $Mutation.AuthorizedKeysAcl = [pscustomobject]@{
+    # Keyed by path: a rerun for a different -User or -AuthorizedKeysFile
+    # rebuilds a second file's DACL, and a single slot would keep the first
+    # record and drop the second, leaving -Disable unable to put that one back.
+    $alreadyRecorded = @($Mutation.AuthorizedKeysAcls | Where-Object { $_.Path -eq $Path }).Count -gt 0
+
+    if ($FileExisted -and -not $alreadyRecorded) {
+        [void]$Mutation.AuthorizedKeysAcls.Add([pscustomobject]@{
             Path = $Path
             Sddl = $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
-        }
+        })
     }
 
     # $true: protect from inheritance. $false: do not copy the inherited
@@ -470,6 +477,45 @@ function Start-SshService {
     }
 }
 
+function Get-OpenSshValue {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $entry = Get-ItemProperty -Path $OpenSshKeyPath -Name $Name -ErrorAction SilentlyContinue
+    if (-not $entry) {
+        return $null
+    }
+
+    [string]$entry.$Name
+}
+
+function Set-OpenSshValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    # A null means "this value did not exist", so putting that back is removing
+    # it rather than writing an empty string.
+    if ($null -eq $Value -or "$Value" -eq "") {
+        if ($null -ne (Get-OpenSshValue -Name $Name)) {
+            Remove-ItemProperty -Path $OpenSshKeyPath -Name $Name
+        }
+
+        return
+    }
+
+    New-ItemProperty `
+        -Path $OpenSshKeyPath `
+        -Name $Name `
+        -Value "$Value" `
+        -PropertyType String `
+        -Force | Out-Null
+}
+
 function Set-SshDefaultShell {
     param(
         [Parameter(Mandatory = $true)]
@@ -486,24 +532,20 @@ function Set-SshDefaultShell {
         New-Item -Path $OpenSshKeyPath -Force | Out-Null
     }
 
-    $entry = Get-ItemProperty -Path $OpenSshKeyPath -Name $DefaultShellValueName -ErrorAction SilentlyContinue
-    $prior = if ($entry) { [string]$entry.$DefaultShellValueName } else { $null }
+    $prior = Get-OpenSshValue -Name $DefaultShellValueName
+    $priorOption = Get-OpenSshValue -Name $DefaultShellCommandOptionValueName
 
     # Recorded before the write, for the same reason as the service above. A
     # null prior records "the value did not exist", which -Disable restores by
     # deleting it again -- sshd falls back to cmd.exe on its own.
     $Mutation.DefaultShell = $prior
+    $Mutation.DefaultShellCommandOption = $priorOption
     $Mutation.DefaultShellManaged = $true
 
     if ($prior -and $prior -ieq $CmdPath) {
         Write-Host "  Already $CmdPath"
     } else {
-        New-ItemProperty `
-            -Path $OpenSshKeyPath `
-            -Name $DefaultShellValueName `
-            -Value $CmdPath `
-            -PropertyType String `
-            -Force | Out-Null
+        Set-OpenSshValue -Name $DefaultShellValueName -Value $CmdPath
 
         if ($prior) {
             Write-Host "  Set to $CmdPath (was $prior)."
@@ -511,13 +553,28 @@ function Set-SshDefaultShell {
             Write-Host "  Set to $CmdPath"
         }
     }
+
+    # The switch sshd passes that shell. A machine set up for a Unix-style or
+    # PowerShell default shell carries -c or -Command here, and changing only
+    # DefaultShell would leave sshd running `cmd.exe -c ...` -- cmd wants /c, so
+    # every exec request would fail while this step reported the shell
+    # configured. Absent is right for cmd, which is sshd's own default, so only
+    # a value that is there and wrong gets corrected.
+    if ($priorOption -and $priorOption -ne $CmdCommandOption) {
+        Set-OpenSshValue -Name $DefaultShellCommandOptionValueName -Value $CmdCommandOption
+        Write-Host "  Command option set to $CmdCommandOption (was $priorOption)."
+    }
 }
 
 function Restore-SshDefaultShell {
     param(
         [Parameter(Mandatory = $true)]
         [AllowNull()]
-        [object]$Value
+        [object]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$CommandOption
     )
 
     if (-not (Test-Path $OpenSshKeyPath)) {
@@ -525,26 +582,15 @@ function Restore-SshDefaultShell {
         return
     }
 
+    # Both halves, since setting a shell can have changed both.
+    Set-OpenSshValue -Name $DefaultShellValueName -Value $Value
+    Set-OpenSshValue -Name $DefaultShellCommandOptionValueName -Value $CommandOption
+
     if ($null -eq $Value -or "$Value" -eq "") {
-        $entry = Get-ItemProperty -Path $OpenSshKeyPath -Name $DefaultShellValueName -ErrorAction SilentlyContinue
-        if (-not $entry) {
-            Write-Host "  Default shell not set."
-        } else {
-            Remove-ItemProperty -Path $OpenSshKeyPath -Name $DefaultShellValueName
-            Write-Host "  Default shell value removed; sshd falls back to cmd.exe."
-        }
-
-        return
+        Write-Host "  Default shell value removed; sshd falls back to cmd.exe."
+    } else {
+        Write-Host "  Default shell restored to its previous value ($Value)."
     }
-
-    New-ItemProperty `
-        -Path $OpenSshKeyPath `
-        -Name $DefaultShellValueName `
-        -Value "$Value" `
-        -PropertyType String `
-        -Force | Out-Null
-
-    Write-Host "  Default shell restored to its previous value ($Value)."
 }
 
 function Get-PortCoverage {
@@ -822,7 +868,8 @@ function Save-EnableState {
             SshStartType        = $Mutation.SshStartType
             SshWasRunning       = $Mutation.SshWasRunning
             CapabilityInstalled = $Mutation.CapabilityInstalled
-            AuthorizedKeysAcl   = $Mutation.AuthorizedKeysAcl
+            DefaultShellCommandOption = $Mutation.DefaultShellCommandOption
+            AuthorizedKeysAcls  = @($Mutation.AuthorizedKeysAcls)
             AdjustedRules       = @($Mutation.AdjustedRules)
             AuthorizedKeys      = @($Mutation.AuthorizedKeys)
         })
@@ -839,9 +886,10 @@ function Save-EnableState {
     $defaultShell = if ($state.DefaultShellManaged) { $state.DefaultShell } else { $Mutation.DefaultShell }
     $serviceKnown = $null -ne $state.SshStartType
 
-    # The first rebuild is the one that saw the machine's own DACL; a rerun
-    # would only capture what this script already wrote.
-    $keysAcl = if ($state.AuthorizedKeysAcl) { $state.AuthorizedKeysAcl } else { $Mutation.AuthorizedKeysAcl }
+    # The first rebuild of a given file saw the machine's own DACL for it; a
+    # later run would only capture what this script already wrote. Per path,
+    # because a rerun can rebuild a different file's DACL entirely.
+    $knownAclPaths = @(@($state.AuthorizedKeysAcls) | ForEach-Object { $_.Path })
 
     Save-RemoteMcpState -State ([ordered]@{
         DefaultShell        = $defaultShell
@@ -849,7 +897,8 @@ function Save-EnableState {
         SshStartType        = $(if ($serviceKnown) { $state.SshStartType } else { $Mutation.SshStartType })
         SshWasRunning       = $(if ($serviceKnown) { $state.SshWasRunning } else { $Mutation.SshWasRunning })
         CapabilityInstalled = ([bool]$state.CapabilityInstalled -or $Mutation.CapabilityInstalled)
-        AuthorizedKeysAcl   = $keysAcl
+        DefaultShellCommandOption = $(if ($state.DefaultShellManaged) { $state.DefaultShellCommandOption } else { $Mutation.DefaultShellCommandOption })
+        AuthorizedKeysAcls  = @(@($state.AuthorizedKeysAcls) + @($Mutation.AuthorizedKeysAcls | Where-Object { $knownAclPaths -notcontains $_.Path }))
         AdjustedRules       = @(@($state.AdjustedRules) + @($Mutation.AdjustedRules | Where-Object { $knownRules -notcontains $_.Name }))
         AuthorizedKeys      = @(@($state.AuthorizedKeys) + @($Mutation.AuthorizedKeys | Where-Object { $knownKeys -notcontains "$($_.Path)|$($_.Key)" }))
     })
@@ -1013,7 +1062,7 @@ if ($Disable) {
         Write-Host "  Default shell was not set by this script; left alone."
     } else {
         try {
-            Restore-SshDefaultShell -Value $state.DefaultShell
+            Restore-SshDefaultShell -Value $state.DefaultShell -CommandOption $state.DefaultShellCommandOption
         } catch {
             Write-Warning "  Could not restore the default shell: $($_.Exception.Message)"
             $script:UnfinishedRestore += "the default shell"
@@ -1044,13 +1093,15 @@ if ($Disable) {
     # After the keys, not before: removing them needs the write access this is
     # about to give away.
     if ($SkipKeys) {
-        # The keys are still in the file, so the ACL that protects them stays.
-    } elseif ($state -and $state.AuthorizedKeysAcl) {
-        try {
-            Restore-AuthorizedKeysAcl -Record $state.AuthorizedKeysAcl
-        } catch {
-            Write-Warning "  Could not restore the ACL on '$($state.AuthorizedKeysAcl.Path)': $($_.Exception.Message)"
-            $script:UnfinishedRestore += "the ACL on $($state.AuthorizedKeysAcl.Path)"
+        # The keys are still in the files, so the ACLs that protect them stay.
+    } elseif ($state) {
+        foreach ($record in @(@($state.AuthorizedKeysAcls) | Where-Object { $_ })) {
+            try {
+                Restore-AuthorizedKeysAcl -Record $record
+            } catch {
+                Write-Warning "  Could not restore the ACL on '$($record.Path)': $($_.Exception.Message)"
+                $script:UnfinishedRestore += "the ACL on $($record.Path)"
+            }
         }
     }
 
@@ -1139,7 +1190,8 @@ $mutation = [ordered]@{
     SshStartType        = $null
     SshWasRunning       = $null
     CapabilityInstalled = $false
-    AuthorizedKeysAcl   = $null
+    DefaultShellCommandOption = $null
+    AuthorizedKeysAcls  = New-Object System.Collections.ArrayList
     AdjustedRules       = New-Object System.Collections.ArrayList
     AuthorizedKeys      = New-Object System.Collections.ArrayList
 }
@@ -1224,7 +1276,10 @@ if ($Port -ne 22) {
     Write-Host "  Also scoped:     22/tcp, where the OpenSSH capability's own exception sits"
 }
 
-$vmAddresses = Get-VMIPv4Address
+# @() because the pipeline unrolls a one-element array into a bare string, and
+# indexing a string picks a character: a VM with a single NIC -- the ordinary
+# case -- would print "HostName 1" for 172.20.1.5.
+$vmAddresses = @(Get-VMIPv4Address)
 if ($vmAddresses.Count -gt 0) {
     Write-Host "  This VM:         $($vmAddresses -join ', ')"
 }
