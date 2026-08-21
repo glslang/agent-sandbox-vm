@@ -280,6 +280,10 @@ scripted rather than described:
   `Connection refused` at once. The script adds its own rule on `-FirewallProfile` (default `Any`)
   scoped to `-ClientAddress`, and narrows every other inbound rule on that port to the same
   allowlist -- firewall allow rules are additive, so a narrow rule cannot claw back a wider one.
+  Narrows, never widens: a rule scoped to `Any` becomes the allowlist, one already naming only
+  addresses from it is left alone, one that overlaps is cut to the overlap, and one whose scope
+  cannot be compared to the request without guessing at containment (`10.0.0.5` against
+  `LocalSubnet`) is left untouched and fails the run rather than being written over.
   A rule counts as being on that port whether its filter names the port exactly or a range spanning
   it, and a rule that cannot be narrowed -- one managed by group policy, typically -- fails the run
   rather than letting it report a boundary the rule still overrides. One whose filter is `LocalPort Any` is never
@@ -332,6 +336,10 @@ and is the better place for anything secret.
 Windows OpenSSH hands a member of the Administrators group a full, unfiltered token, so a server's
 elevation-only tools do work over this. That is the host's logon policy rather than a guarantee, and
 the printed summary includes the one-line check.
+
+`-Disable` exits non-zero when something it tried to put back is still in place, so a script driving
+it can tell that from a clean close; a `-Skip` switch is a choice rather than a failure and does not
+affect the status.
 
 To close it again:
 

@@ -143,6 +143,11 @@ $StatePath = Join-Path $env:ProgramData "agent-sandbox\remote-mcp-ssh.json"
 # discarded while the machine is still changed cannot be retried.
 $script:UnfinishedRestore = @()
 
+# Set only where a restore or a write actually failed -- not where a -Skip
+# switch deliberately held one back. It decides this run's exit status, so
+# automation can tell "closed" from "could not finish closing".
+$script:RestoreFailed = $false
+
 function Set-FileContentAtomically {
     param(
         [Parameter(Mandatory = $true)]
@@ -723,9 +728,30 @@ function Restore-SshDefaultShell {
     # not be saved leaves the full one on disk -- and putting a pre-enable value
     # over a shell somebody set in the meantime is the one outcome worse than
     # leaving it alone.
-    $current = Get-OpenSshValue -Name $DefaultShellValueName
-    if ($current -and -not ($current -ieq $CmdPath)) {
-        Write-Host "  Default shell is now $current, which this script did not set; left alone."
+    # Both values, and a missing one counts: an administrator who deleted
+    # DefaultShell has removed exactly what this script wrote, so reinstating
+    # the pre-enable value over that is no better than overwriting a new one.
+    $currentShell = Get-OpenSshValue -Name $DefaultShellValueName
+    $currentOption = Get-OpenSshValue -Name $DefaultShellCommandOptionValueName
+
+    # What this run left behind: cmd.exe, and /c only where there had been an
+    # option value that was not already /c. Where there was none, none was
+    # written, and the recorded value is what should still be there.
+    $expectedOption = if ($CommandOption -and -not ("$CommandOption" -ieq $CmdCommandOption)) {
+        $CmdCommandOption
+    } else {
+        $CommandOption
+    }
+
+    if (-not ($currentShell -and ("$currentShell" -ieq $CmdPath))) {
+        $now = if ($currentShell) { $currentShell } else { "not set" }
+        Write-Host "  Default shell is now $now, which this script did not leave there; left alone."
+        return
+    }
+
+    if (-not ("$currentOption" -ieq "$expectedOption")) {
+        $now = if ($currentOption) { $currentOption } else { "not set" }
+        Write-Host "  Default shell command option is now $now, which this script did not leave there; shell and option left alone."
         return
     }
 
@@ -1002,6 +1028,54 @@ function Enable-RemoteMcpFirewall {
         # address they did not ask for. Only ever narrow -- widening someone
         # else's rule to match a broader request would hand out access this
         # script was never asked to grant.
+        #
+        # That went for the profile but not, until now, for the address: this
+        # loop assigned -ClientAddress unconditionally, so a rule already
+        # scoped tighter than the request (10.0.0.5 against LocalSubnet) came
+        # out WIDER than it went in.
+        #
+        # The address filter is only written where the result is demonstrably
+        # narrower, which can be settled without doing subnet arithmetic:
+        #
+        #   "Any" alone    the universal set, so the request is narrower
+        #   inside request every address already named in -ClientAddress: leave
+        #   overlapping    narrow to the overlap, a subset of what it had
+        #   otherwise      cannot be compared without guessing at containment
+        #
+        # The last case is left untouched and reported, because both of the
+        # alternatives are worse: widening someone else's rule, or claiming a
+        # boundary this script cannot show it enforced.
+        $narrowedAddress = $null
+        $uncomparableAddress = $false
+        $addressWithinRequest = $true
+
+        foreach ($address in $priorAddress) {
+            if ($RemoteAddress -notcontains "$address") {
+                $addressWithinRequest = $false
+                break
+            }
+        }
+
+        if ($priorAddress.Count -eq 1 -and "$($priorAddress[0])" -eq "Any") {
+            $narrowedAddress = $RemoteAddress
+        } elseif ($addressWithinRequest) {
+            # Already inside the request: nothing to do, and writing the
+            # request over it would only add addresses it did not have.
+        } else {
+            $overlap = @($priorAddress | Where-Object { $RemoteAddress -contains "$_" })
+            if ($overlap.Count -gt 0) {
+                $narrowedAddress = $overlap
+            } else {
+                $uncomparableAddress = $true
+            }
+        }
+
+        if ($uncomparableAddress) {
+            Write-Warning "  Left alone, scope not comparable: '$($rule.DisplayName)' is scoped to $($priorAddress -join ', '), which cannot be shown to sit inside $($RemoteAddress -join ', ') without guessing."
+            $unnarrowed += "$($rule.DisplayName) ($($rule.Name)) -- scoped to $($priorAddress -join ', '), which this script cannot compare to $($RemoteAddress -join ', ') without guessing at containment"
+            continue
+        }
+
         $narrowedProfile = $null
         $disableRule = $false
 
@@ -1030,7 +1104,9 @@ function Enable-RemoteMcpFirewall {
         })
 
         try {
-            Set-NetFirewallRule -Name $rule.Name -RemoteAddress $RemoteAddress
+            if ($narrowedAddress) {
+                Set-NetFirewallRule -Name $rule.Name -RemoteAddress $narrowedAddress
+            }
 
             if ($disableRule) {
                 Set-NetFirewallRule -Name $rule.Name -Enabled False
@@ -1050,7 +1126,8 @@ function Enable-RemoteMcpFirewall {
             Write-Host "  Disabled existing SSH exception outside the requested profiles: $($rule.DisplayName) (was $($priorProfile -join ', '))"
         } else {
             $scopeNow = if ($narrowedProfile) { $narrowedProfile -join ', ' } else { $priorProfile -join ', ' }
-            Write-Host "  Narrowed existing SSH exception: $($rule.DisplayName) (was $($priorAddress -join ', ') on $($priorProfile -join ', '); now $($RemoteAddress -join ', ') on $scopeNow)"
+            $addressNow = if ($narrowedAddress) { $narrowedAddress -join ', ' } else { $priorAddress -join ', ' }
+            Write-Host "  Narrowed existing SSH exception: $($rule.DisplayName) (was $($priorAddress -join ', ') on $($priorProfile -join ', '); now $addressNow on $scopeNow)"
         }
     }
 
@@ -1223,6 +1300,7 @@ function Disable-RemoteMcpFirewall {
         } catch {
             Write-Warning "  Could not restore '$($record.Name)': $($_.Exception.Message)"
             $script:UnfinishedRestore += "firewall rule $($record.Name)"
+            $script:RestoreFailed = $true
             [void]$Remaining.Add($record)
         }
     }
@@ -1282,6 +1360,7 @@ function Restore-SshService {
     } catch {
         Write-Warning "  Could not restore the sshd service: $($_.Exception.Message)"
         $script:UnfinishedRestore += "the sshd service"
+        $script:RestoreFailed = $true
         $Remaining.SshStartType = $State.SshStartType
         $Remaining.SshWasRunning = $State.SshWasRunning
         $Remaining.CapabilityInstalled = $State.CapabilityInstalled
@@ -1347,6 +1426,7 @@ if ($Disable) {
         $state = Get-RemoteMcpState
     } catch {
         $stateUnreadable = $true
+        $script:RestoreFailed = $true
         Write-Warning $_.Exception.Message
     }
 
@@ -1400,6 +1480,7 @@ if ($Disable) {
         } catch {
             Write-Warning "  Could not restore the default shell: $($_.Exception.Message)"
             $script:UnfinishedRestore += "the default shell"
+            $script:RestoreFailed = $true
             $remaining.DefaultShell = $state.DefaultShell
             $remaining.DefaultShellManaged = $true
             $remaining.DefaultShellCommandOption = $state.DefaultShellCommandOption
@@ -1428,6 +1509,7 @@ if ($Disable) {
             } catch {
                 Write-Warning "  Could not remove key from '$($record.Path)': $($_.Exception.Message)"
                 $script:UnfinishedRestore += "key in $($record.Path)"
+                $script:RestoreFailed = $true
                 [void]$remaining.AuthorizedKeys.Add($record)
                 $keysOutstanding += $record.Path
             }
@@ -1462,6 +1544,7 @@ if ($Disable) {
             } catch {
                 Write-Warning "  Could not restore the ACL on '$($record.Path)': $($_.Exception.Message)"
                 $script:UnfinishedRestore += "the ACL on $($record.Path)"
+                $script:RestoreFailed = $true
                 [void]$remaining.AuthorizedKeysAcls.Add($record)
             }
         }
@@ -1500,6 +1583,7 @@ if ($Disable) {
                 # that file still lists components this run has already put
                 # back, and a later -Disable reading it would treat them as
                 # outstanding. Say so rather than let that be discovered later.
+                $script:RestoreFailed = $true
                 Write-Warning "Could not write the reduced record to $StatePath ($($_.Exception.Message))."
                 Write-Warning "$StatePath still describes the state before this run and now over-describes it: it lists components this run already restored. Rerunning -Disable against it would try to put those back a second time. Not put back this run: $($script:UnfinishedRestore -join '; '). Reconcile or remove that file before rerunning."
             }
@@ -1509,7 +1593,20 @@ if ($Disable) {
     }
 
     Write-Host ""
-    Write-Host "Remote MCP access closed. The OpenSSH Server capability and its host keys were left installed."
+    if ($script:RestoreFailed) {
+        # Not "closed": something this script changed is still in place. Said
+        # in the exit status too, so a script driving this can tell the two
+        # apart -- a -Skip switch is a choice and does not come through here.
+        Write-Warning "Remote MCP access was NOT fully closed. Still in place: $($script:UnfinishedRestore -join '; ')."
+        exit 1
+    }
+
+    if ($script:UnfinishedRestore.Count -gt 0) {
+        Write-Host "Remote MCP access closed except where a -Skip switch held it back: $($script:UnfinishedRestore -join '; ')."
+    } else {
+        Write-Host "Remote MCP access closed. The OpenSSH Server capability and its host keys were left installed."
+    }
+
     exit 0
 }
 
