@@ -1001,6 +1001,18 @@ function Restore-SshService {
     }
 }
 
+function ConvertTo-PosixSingleQuoted {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    # A POSIX single-quoted string can hold anything except a single quote, so
+    # every quote is closed, escaped and reopened: ' becomes '\''. Windows
+    # paths cannot contain a double quote, so nothing else needs escaping.
+    "'" + $Value.Replace("'", "'\''") + "'"
+}
+
 function Get-VMIPv4Address {
     try {
         $addresses = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
@@ -1289,12 +1301,17 @@ if (-not (Test-PortListening -Port $Port)) {
 }
 
 $sshHostName = if ($vmAddresses.Count -gt 0) { $vmAddresses[0] } else { "<vm-address>" }
-# Quoted twice on purpose. ssh joins its remaining arguments into ONE string
-# and hands that to the remote shell, so the client shell's own quotes are gone
-# by then -- a path with a space would reach cmd.exe bare and run only the part
-# before the first space. The inner double quotes are what survives the trip.
+# Quoted twice on purpose, and by different rules. ssh joins its remaining
+# arguments into ONE string and hands that to the remote shell, so the client
+# shell's own quotes are gone by then -- a path with a space would reach
+# cmd.exe bare and run only the part before the first space. The inner double
+# quotes are what survives the trip; the outer single quotes are what gets it
+# past the client shell in one piece, and they are applied by the escaper
+# rather than written into the text, because a path containing an apostrophe
+# (C:\Users\O'Brien\...) would otherwise close them early and break the line
+# before ssh ever ran.
 $remoteCommand = if ($ServerCommand) { $ServerCommand } else { "<path-to-mcp-server.exe>" }
-$remoteCommand = '"' + $remoteCommand + '"' 
+$remoteCommandArg = ConvertTo-PosixSingleQuoted -Value ('"' + $remoteCommand + '"')
 $portLine = if ($Port -ne 22) { "`n      Port $Port" } else { "" }
 $probeJson = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
 
@@ -1318,7 +1335,7 @@ prompt no one will see, because an MCP client's stdin belongs to the protocol.
 Prove the handshake before registering anything:
 
   printf '%s\n' '$probeJson' \
-      | ssh -T $SshHostAlias '$remoteCommand' | cat -vet | head -3
+      | ssh -T $SshHostAlias $remoteCommandArg | cat -vet | head -3
 
 One line of JSON on stdout carrying serverInfo, and no ^M anywhere, is the pass.
 A ^M, a shell banner, or a blank first line means the default shell is
@@ -1329,7 +1346,7 @@ names no cause.
 Register it -- local scope, because an address, a user name and an absolute path
 are machine-specific and do not belong in a repository's .mcp.json:
 
-  claude mcp add $SshHostAlias --scope local -- ssh -T $SshHostAlias '$remoteCommand'
+  claude mcp add $SshHostAlias --scope local -- ssh -T $SshHostAlias $remoteCommandArg
 
 Two things worth checking once, since guessing wrong costs a confusing failure
 much later:
