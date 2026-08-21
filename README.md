@@ -293,14 +293,18 @@ scripted rather than described:
   you are kernel debugging -- sshd ignores `~/.ssh/authorized_keys` and reads
   `C:\ProgramData\ssh\administrators_authorized_keys`. A key in the other file is not an error
   anywhere; it is just a login that never authenticates. Membership is resolved through nested
-  groups, since sshd reads it off the logon token; where it cannot be resolved at all -- a domain
-  group among the members -- the run says so, and the summary always names the file it chose.
+  groups, since sshd reads it off the logon token. Where it cannot be resolved -- a domain group in
+  the chain, which no local lookup can expand -- the run refuses to guess and stops before changing
+  anything, naming the group it could not read; `-AuthorizedKeysFile Administrators` or
+  `-AuthorizedKeysFile PerUser` settles it. The summary always names the file it used.
 - **Its ACL.** sshd refuses an authorized-keys file any other principal can write, and logs the
   refusal nowhere you would think to look. The script rebuilds the file's DACL to grant only
   Administrators and SYSTEM, by well-known SID rather than by group name so it works on a
   non-English Windows too. Rebuilt rather than amended: `icacls /inheritance:r /grant` reads like it
   tightens a file, but `/inheritance:r` drops only *inherited* entries and `/grant` only adds or
-  updates the trustees it names, so an explicit entry for anyone else would survive both.
+  updates the trustees it names, so an explicit entry for anyone else would survive both. Since
+  rebuilding is destructive -- an entry another account or a management tool relied on goes with it
+  -- the DACL being replaced is recorded first, and `-Disable` puts it back.
 
 Environment matters differently over ssh: the session inherits machine and user variables from the
 registry but **nothing** from a PowerShell `$PROFILE`, so a server configured by environment variable
@@ -319,7 +323,8 @@ powershell -ExecutionPolicy RemoteSigned -File C:\Setup-RemoteMcp.ps1 -Disable
 ```
 
 Prior scope, profile, and enabled state of every rule it touched, the previous default shell, the
-sshd startup type and running state, and the keys it installed go to
+sshd startup type and running state, the authorized-keys DACL it replaced, and the keys it installed
+go to
 `C:\ProgramData\agent-sandbox\remote-mcp-ssh.json` so `-Disable` puts them back exactly. Rerunning
 enable never overwrites that record, and a run that fails part way still records what it had already
 changed -- a machine left modified with nothing written down is one `-Disable` cannot help.
