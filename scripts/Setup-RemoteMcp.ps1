@@ -953,7 +953,14 @@ function Disable-RemoteMcpFirewall {
     param(
         [Parameter(Mandatory = $true)]
         [AllowNull()]
-        [object]$State
+        [object]$State,
+
+        # Rule records this run could not restore. What stays here is what a
+        # later -Disable still has to do; anything restored is dropped, so it
+        # is never re-applied over a scope someone set in the meantime.
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.ArrayList]$Remaining
     )
 
     $existingRule = Get-NetFirewallRule -Name $SshRuleId -ErrorAction SilentlyContinue
@@ -988,6 +995,7 @@ function Disable-RemoteMcpFirewall {
         } catch {
             Write-Warning "  Could not restore '$($record.Name)': $($_.Exception.Message)"
             $script:UnfinishedRestore += "firewall rule $($record.Name)"
+            [void]$Remaining.Add($record)
         }
     }
 }
@@ -1015,7 +1023,10 @@ function Restore-SshService {
     param(
         [Parameter(Mandatory = $true)]
         [AllowNull()]
-        [object]$State
+        [object]$State,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Remaining
     )
 
     if (-not $State -or -not $State.SshStartType) {
@@ -1043,6 +1054,9 @@ function Restore-SshService {
     } catch {
         Write-Warning "  Could not restore the sshd service: $($_.Exception.Message)"
         $script:UnfinishedRestore += "the sshd service"
+        $Remaining.SshStartType = $State.SshStartType
+        $Remaining.SshWasRunning = $State.SshWasRunning
+        $Remaining.CapabilityInstalled = $State.CapabilityInstalled
     }
 }
 
@@ -1108,18 +1122,43 @@ if ($Disable) {
         Write-Warning $_.Exception.Message
     }
 
+    # What this run leaves undone, in the shape of the record itself. A
+    # component that WAS put back is dropped rather than carried, so a retry
+    # only retries what is outstanding: keeping a restored component would let
+    # a later -Disable re-apply the value from before the first enable over
+    # whatever was configured in the meantime.
+    $remaining = [ordered]@{
+        DefaultShell              = $null
+        DefaultShellManaged       = $false
+        DefaultShellCommandOption = $null
+        SshStartType              = $null
+        SshWasRunning             = $null
+        CapabilityInstalled       = $false
+        AuthorizedKeysAcls        = New-Object System.Collections.ArrayList
+        AdjustedRules             = New-Object System.Collections.ArrayList
+        AuthorizedKeys            = New-Object System.Collections.ArrayList
+    }
+
     Write-Host "Closing remote MCP access:"
 
     if ($SkipFirewall) {
         Write-Host "  Skipped firewall changes (-SkipFirewall specified)."
         $script:UnfinishedRestore += "the firewall (-SkipFirewall)"
+        foreach ($record in @(@($state.AdjustedRules) | Where-Object { $_ })) {
+            [void]$remaining.AdjustedRules.Add($record)
+        }
     } else {
-        Disable-RemoteMcpFirewall -State $state
+        Disable-RemoteMcpFirewall -State $state -Remaining $remaining.AdjustedRules
     }
 
     if ($SkipDefaultShell) {
         Write-Host "  Skipped default shell (-SkipDefaultShell specified)."
         $script:UnfinishedRestore += "the default shell (-SkipDefaultShell)"
+        if ($state) {
+            $remaining.DefaultShell = $state.DefaultShell
+            $remaining.DefaultShellManaged = [bool]$state.DefaultShellManaged
+            $remaining.DefaultShellCommandOption = $state.DefaultShellCommandOption
+        }
     } elseif (-not $state) {
         Write-Host "  No saved state; default shell left alone."
     } elseif (-not $state.DefaultShellManaged) {
@@ -1133,12 +1172,18 @@ if ($Disable) {
         } catch {
             Write-Warning "  Could not restore the default shell: $($_.Exception.Message)"
             $script:UnfinishedRestore += "the default shell"
+            $remaining.DefaultShell = $state.DefaultShell
+            $remaining.DefaultShellManaged = $true
+            $remaining.DefaultShellCommandOption = $state.DefaultShellCommandOption
         }
     }
 
     if ($SkipKeys) {
         Write-Host "  Left installed keys in place (-SkipKeys specified)."
         $script:UnfinishedRestore += "the installed keys (-SkipKeys)"
+        foreach ($record in @(@($state.AuthorizedKeys) | Where-Object { $_ })) {
+            [void]$remaining.AuthorizedKeys.Add($record)
+        }
     } elseif ($state) {
         $records = @(@($state.AuthorizedKeys) | Where-Object { $_ })
         if ($records.Count -eq 0) {
@@ -1151,6 +1196,7 @@ if ($Disable) {
             } catch {
                 Write-Warning "  Could not remove key from '$($record.Path)': $($_.Exception.Message)"
                 $script:UnfinishedRestore += "key in $($record.Path)"
+                [void]$remaining.AuthorizedKeys.Add($record)
             }
         }
     } else {
@@ -1161,6 +1207,9 @@ if ($Disable) {
     # about to give away.
     if ($SkipKeys) {
         # The keys are still in the files, so the ACLs that protect them stay.
+        foreach ($record in @(@($state.AuthorizedKeysAcls) | Where-Object { $_ })) {
+            [void]$remaining.AuthorizedKeysAcls.Add($record)
+        }
     } elseif ($state) {
         foreach ($record in @(@($state.AuthorizedKeysAcls) | Where-Object { $_ })) {
             try {
@@ -1168,23 +1217,37 @@ if ($Disable) {
             } catch {
                 Write-Warning "  Could not restore the ACL on '$($record.Path)': $($_.Exception.Message)"
                 $script:UnfinishedRestore += "the ACL on $($record.Path)"
+                [void]$remaining.AuthorizedKeysAcls.Add($record)
             }
         }
     }
 
-    Restore-SshService -State $state
+    Restore-SshService -State $state -Remaining $remaining
 
     if ($stateUnreadable) {
         Write-Host ""
         Write-Warning "Kept $StatePath -- it could not be read, so nothing recorded in it was put back. Only this script's own firewall rule was removed."
     } elseif ($state) {
-        # The record is the only way back for anything still changed, and a
-        # failure here is usually transient -- a group-policy rule, a service
-        # mid-transition. Keep it so a later -Disable can pick up where this
-        # one stopped; every step above is idempotent.
-        if ($script:UnfinishedRestore.Count -gt 0) {
+        # What is still changed is the only thing worth keeping, and a failure
+        # here is usually transient -- a group-policy rule, a service
+        # mid-transition. Write back just that, so a later -Disable picks up
+        # where this one stopped without re-applying anything already restored.
+        $stillChanged = (
+            $remaining.DefaultShellManaged -or
+            $null -ne $remaining.SshStartType -or
+            @($remaining.AdjustedRules).Count -gt 0 -or
+            @($remaining.AuthorizedKeys).Count -gt 0 -or
+            @($remaining.AuthorizedKeysAcls).Count -gt 0
+        )
+
+        if ($stillChanged) {
+            $remaining.AuthorizedKeysAcls = @($remaining.AuthorizedKeysAcls)
+            $remaining.AdjustedRules = @($remaining.AdjustedRules)
+            $remaining.AuthorizedKeys = @($remaining.AuthorizedKeys)
+
+            Save-RemoteMcpState -State $remaining
             Write-Host ""
-            Write-Warning "Kept $StatePath -- not put back: $($script:UnfinishedRestore -join '; '). Rerun -Disable once the cause is fixed."
+            Write-Warning "Kept $StatePath -- not put back: $($script:UnfinishedRestore -join '; '). Rerun -Disable once the cause is fixed; what it already restored has been dropped from the record."
         } else {
             Remove-Item -Path $StatePath -Force
         }
@@ -1271,6 +1334,8 @@ $mutation = [ordered]@{
     AuthorizedKeys      = New-Object System.Collections.ArrayList
 }
 
+$setupFailed = $false
+
 try {
     Write-Host "[1/4] OpenSSH Server:"
     $mutation.CapabilityInstalled = Install-OpenSshServer
@@ -1328,12 +1393,23 @@ try {
 
         Write-Host "  ACL tightened on $authorizedKeysPath"
     }
+} catch {
+    $setupFailed = $true
+    throw
 } finally {
-    # Never let a failure here replace the exception that got us here.
     try {
         Save-EnableState -Mutation $mutation -State $existingState
     } catch {
-        Write-Warning "Could not record what this run changed to $StatePath ($($_.Exception.Message)); -Disable will not be able to put it back."
+        if ($setupFailed) {
+            # Something already went wrong and is on its way up; replacing that
+            # exception with this one would hide the cause.
+            Write-Warning "Could not record what this run changed to $StatePath ($($_.Exception.Message)); -Disable will not be able to put it back."
+        } else {
+            # The machine was changed and the record was not written. Saying
+            # "setup ready" here and exiting 0 would report a success that
+            # cannot be undone, so this run fails on it.
+            throw "Setup was applied but could not be recorded to $StatePath ($($_.Exception.Message)). -Disable cannot put back what it cannot read, so fix that path and rerun -- every step is idempotent."
+        }
     }
 }
 
