@@ -143,6 +143,34 @@ $StatePath = Join-Path $env:ProgramData "agent-sandbox\remote-mcp-ssh.json"
 # discarded while the machine is still changed cannot be retried.
 $script:UnfinishedRestore = @()
 
+function Set-FileContentAtomically {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [byte[]]$Bytes
+    )
+
+    # Written beside the file and swapped in, never over it: a write that
+    # cannot finish -- a full disk, a reset VM -- would otherwise leave a
+    # truncated file where the only copy of something was. File::Replace also
+    # keeps the destination's ACL, which for an authorized-keys file is the
+    # tightened one this script put there.
+    #
+    # [NullString]::Value, not $null: PowerShell binds $null to a .NET string
+    # parameter as an empty string, which Replace rejects.
+    $temp = "$Path.new"
+    [System.IO.File]::WriteAllBytes($temp, $Bytes)
+
+    if (Test-Path $Path) {
+        [System.IO.File]::Replace($temp, $Path, [NullString]::Value)
+    } else {
+        Move-Item -Path $temp -Destination $Path -Force
+    }
+}
+
 function Get-RemoteMcpState {
     # $null means there is no record. A record that exists but cannot be parsed
     # throws instead, because the two must never be confused: read as "no
@@ -171,22 +199,12 @@ function Save-RemoteMcpState {
         New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
     }
 
-    # Written beside the record and swapped in, never written over it. This is
-    # the only way back for a machine this script has changed, and a write
-    # interrupted half way -- a full disk, a reset VM -- would leave truncated
-    # JSON where the original firewall scope, shell and keys used to be. A
-    # failed write this way costs the update, not the record.
-    $temp = "$StatePath.new"
-    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $temp -Encoding UTF8
+    # This record is the only way back for a machine this script has changed,
+    # so it is swapped in rather than written over.
+    $json = $State | ConvertTo-Json -Depth 5
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-    if (Test-Path $StatePath) {
-        # [NullString]::Value, not $null: PowerShell turns $null into an empty
-        # string when binding to a .NET string parameter, and Replace rejects
-        # that -- so every update after the first would fail here.
-        [System.IO.File]::Replace($temp, $StatePath, [NullString]::Value)
-    } else {
-        Move-Item -Path $temp -Destination $StatePath -Force
-    }
+    Set-FileContentAtomically -Path $StatePath -Bytes $utf8NoBom.GetBytes($json)
 }
 
 function Resolve-PublicKey {
@@ -505,7 +523,10 @@ function Remove-AuthorizedKey {
         $start = $end
     }
 
-    [System.IO.File]::WriteAllBytes($Path, $kept.ToArray())
+    # Swapped in rather than written over: unrelated keys and comments in this
+    # file are not recorded anywhere, so a half-written file would lose them
+    # with nothing able to put them back.
+    Set-FileContentAtomically -Path $Path -Bytes $kept.ToArray()
     $kept.Dispose()
     Write-Host "  Key removed from $Path"
 }
@@ -833,6 +854,10 @@ function Enable-RemoteMcpFirewall {
         Write-Warning "  Not narrowed: '$($rule.DisplayName)' allows inbound TCP on ANY local port, so it may reach sshd from outside $($RemoteAddress -join ', '). Review it by hand."
     }
 
+    # Exceptions this run could not narrow. -ClientAddress is the whole claim
+    # this step makes, so a rule left wide is not a warning to read past.
+    $unnarrowed = @()
+
     foreach ($rule in Get-CompetingSshRule -Port $scopedPorts -Coverage Specific) {
         $priorAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
         $priorProfile = @("$($rule.Profile)" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -878,9 +903,11 @@ function Enable-RemoteMcpFirewall {
                 Set-NetFirewallRule -Name $rule.Name -Profile $narrowedProfile
             }
         } catch {
-            # Group-policy rules cannot be edited locally; say so rather than
-            # letting the summary claim a scope this rule still overrides.
+            # Group-policy rules cannot be edited locally. The run stops on
+            # this below rather than carrying on to report a scope the rule
+            # still overrides.
             Write-Warning "  Could not narrow existing SSH exception '$($rule.DisplayName)': $($_.Exception.Message)"
+            $unnarrowed += "$($rule.DisplayName) ($($rule.Name))"
             continue
         }
 
@@ -935,6 +962,21 @@ function Enable-RemoteMcpFirewall {
             -Profile $FirewallProfile | Out-Null
 
         Write-Host "  Firewall rule created: $SshRuleName"
+    }
+
+    # Thrown after this script's own rule exists and every narrowing that could
+    # be done has been, so the record is complete and -Disable can put it all
+    # back. Firewall allow rules are additive: while one of these still names a
+    # wider scope, sshd is reachable from outside -ClientAddress no matter how
+    # narrow this script's rule is, and reporting "setup ready" over that would
+    # be claiming a boundary that is not there.
+    if ($unnarrowed.Count -gt 0) {
+        throw @"
+Could not narrow $($unnarrowed.Count) existing inbound exception(s) on this port, so -ClientAddress is not the boundary it would have reported:
+  $($unnarrowed -join "`n  ")
+These are usually managed by group policy, which cannot be edited on the machine itself. Narrow or disable them where they are defined and rerun, or rerun with -SkipFirewall if the wider exposure is deliberate.
+Nothing after the firewall step was configured. -Disable puts back what this run did change.
+"@
     }
 }
 
@@ -1512,7 +1554,7 @@ On the client, give this VM a stable name in ~/.ssh/config:
   Host $SshHostAlias
       HostName $sshHostName
       User $User$portLine
-      IdentityFile $ClientIdentityFile
+      IdentityFile "$ClientIdentityFile"
       RequestTTY no
       BatchMode yes
       ServerAliveInterval 30

@@ -281,7 +281,8 @@ scripted rather than described:
   scoped to `-ClientAddress`, and narrows every other inbound rule on that port to the same
   allowlist -- firewall allow rules are additive, so a narrow rule cannot claw back a wider one.
   A rule counts as being on that port whether its filter names the port exactly or a range spanning
-  it. One whose filter is `LocalPort Any` is *reported* rather than rescoped: such a rule is usually
+  it, and a rule that cannot be narrowed -- one managed by group policy, typically -- fails the run
+  rather than letting it report a boundary the rule still overrides. One whose filter is `LocalPort Any` is *reported* rather than rescoped: such a rule is usually
   scoped to a program rather than to a port, making it an app's inbound rule rather than an ssh
   hole, and narrowing every one of them to the ssh client would take the VM's other inbound traffic
   down with it. Reclassifying the network to `Private` instead would work in one line, at the cost of activating
