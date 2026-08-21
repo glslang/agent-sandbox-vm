@@ -123,24 +123,6 @@ $StatePath = Join-Path $env:ProgramData "agent-sandbox\remote-mcp-ssh.json"
 # discarded while the machine is still changed cannot be retried.
 $script:UnfinishedRestore = @()
 
-function Invoke-NativeCommand {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Command,
-
-        [Parameter(Mandatory = $true)]
-        [string[]]$Arguments,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Description
-    )
-
-    & $Command @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Description failed with exit code $LASTEXITCODE."
-    }
-}
-
 function Get-RemoteMcpState {
     if (-not (Test-Path $StatePath)) {
         return $null
@@ -235,21 +217,42 @@ function Test-UserIsAdministrator {
         [string]$Sid
     )
 
-    # sshd decides this from the logon token, which resolves nested groups;
-    # this sees direct members only. Treat anything it cannot answer as
-    # administrator, because that is the direction where guessing wrong is
-    # silent: sshd would read the administrators file while the key sat in the
-    # per-user one, and the login just never authenticates.
-    try {
-        $members = @(Get-LocalGroupMember -SID $AdministratorsSid -ErrorAction Stop)
-    } catch {
-        Write-Warning "  Could not enumerate the local Administrators group ($($_.Exception.Message)); assuming '$Name' is a member."
-        return $true
-    }
+    # sshd decides this from the logon token, which resolves membership
+    # through nested groups. Get-LocalGroupMember returns direct members only,
+    # so walk the nesting: a user who is an administrator through a group would
+    # otherwise get a confident "no", the key would go to the per-user file
+    # while sshd read the administrators one, and every login would fail.
+    $pending = New-Object System.Collections.Queue
+    $pending.Enqueue($AdministratorsSid)
+    $seen = @{}
 
-    foreach ($member in $members) {
-        if ("$($member.SID)" -eq $Sid) {
+    while ($pending.Count -gt 0) {
+        $groupSid = "$($pending.Dequeue())"
+        if ($seen.ContainsKey($groupSid)) {
+            continue
+        }
+
+        $seen[$groupSid] = $true
+
+        try {
+            $members = @(Get-LocalGroupMember -SID $groupSid -ErrorAction Stop)
+        } catch {
+            # A domain group among the members is the ordinary case here: it is
+            # not a local group, so this cannot expand it. Undetermined, and
+            # the caller prints which file it settled on so a wrong guess is
+            # visible rather than silent.
+            Write-Warning "  Could not expand group $groupSid ($($_.Exception.Message)); assuming '$Name' is an administrator."
             return $true
+        }
+
+        foreach ($member in $members) {
+            if ("$($member.SID)" -eq $Sid) {
+                return $true
+            }
+
+            if ("$($member.ObjectClass)" -eq "Group") {
+                $pending.Enqueue("$($member.SID)")
+            }
         }
     }
 
@@ -290,19 +293,41 @@ function Set-AuthorizedKeysAcl {
     # logs the refusal nowhere an operator would think to look -- it presents
     # as "Permission denied (publickey)" with a correct key already in place.
     # This is the single most common way this step fails silently.
-    $grants = if ($IsAdministratorsFile) {
-        @("*$($AdministratorsSid):F", "*$($SystemSid):F")
+    #
+    # The DACL is rebuilt rather than amended. `icacls /inheritance:r /grant`
+    # reads like it tightens a file, but /inheritance:r drops only INHERITED
+    # entries and /grant only adds or updates the trustees it names -- an
+    # explicit entry for anyone else survives both. sshd would go on refusing
+    # the file, or another account would keep write access to the login keys,
+    # while this script reported the ACL tightened.
+    #
+    # By well-known SID rather than group name: a name is localized, and
+    # "Administrators" does not exist on a non-English Windows.
+    $grantSids = if ($IsAdministratorsFile) {
+        @($AdministratorsSid, $SystemSid)
     } else {
-        @("*$($OwnerSid):F", "*$($AdministratorsSid):F", "*$($SystemSid):F")
+        @($OwnerSid, $AdministratorsSid, $SystemSid)
     }
 
-    $arguments = @($Path, "/inheritance:r")
-    foreach ($grant in $grants) {
-        $arguments += "/grant"
-        $arguments += $grant
+    $acl = Get-Acl -Path $Path
+
+    # $true: protect from inheritance. $false: do not copy the inherited
+    # entries down as explicit ones -- they leave the in-memory DACL here, so
+    # the loop below sees only what was explicit to begin with.
+    $acl.SetAccessRuleProtection($true, $false)
+
+    foreach ($rule in @($acl.Access)) {
+        [void]$acl.RemoveAccessRuleSpecific($rule)
     }
 
-    Invoke-NativeCommand -Command "icacls" -Arguments $arguments -Description "icacls on $Path" | Out-Null
+    foreach ($sid in @($grantSids | Select-Object -Unique)) {
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+
+    Set-Acl -Path $Path -AclObject $acl
 }
 
 function Add-AuthorizedKey {
@@ -377,31 +402,42 @@ function Install-OpenSshServer {
 }
 
 function Start-SshService {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Mutation
+    )
+
     $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
     if (-not $service) {
         throw "The sshd service is missing even though the OpenSSH Server capability reports installed. Reboot this VM and rerun."
     }
 
-    $prior = [pscustomobject]@{
-        StartType  = "$($service.StartType)"
-        WasRunning = ($service.Status -eq "Running")
-    }
+    # Written into the record before the first change rather than returned
+    # after the last: Start-Service throws on an invalid sshd_config, with the
+    # startup type already changed, and a return value never reaches the caller
+    # from a function that threw.
+    $priorStartType = "$($service.StartType)"
+    $Mutation.SshStartType = $priorStartType
+    $Mutation.SshWasRunning = ($service.Status -eq "Running")
 
     Set-Service -Name sshd -StartupType Automatic
 
-    if (-not $prior.WasRunning) {
+    if (-not $Mutation.SshWasRunning) {
         # The first start is also what generates the host keys and creates
         # C:\ProgramData\ssh, which the authorized-keys step below needs.
         Start-Service -Name sshd
-        Write-Host "  sshd started; startup type Automatic (was $($prior.StartType))."
+        Write-Host "  sshd started; startup type Automatic (was $priorStartType)."
     } else {
-        Write-Host "  sshd already running; startup type Automatic (was $($prior.StartType))."
+        Write-Host "  sshd already running; startup type Automatic (was $priorStartType)."
     }
-
-    $prior
 }
 
 function Set-SshDefaultShell {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Mutation
+    )
+
     # OpenSSH runs an exec request through the default shell. cmd /c hands the
     # child the inherited pipe handles and stays out of the way; PowerShell
     # captures a native command's output through its own pipeline and applies
@@ -414,6 +450,12 @@ function Set-SshDefaultShell {
 
     $entry = Get-ItemProperty -Path $OpenSshKeyPath -Name $DefaultShellValueName -ErrorAction SilentlyContinue
     $prior = if ($entry) { [string]$entry.$DefaultShellValueName } else { $null }
+
+    # Recorded before the write, for the same reason as the service above. A
+    # null prior records "the value did not exist", which -Disable restores by
+    # deleting it again -- sshd falls back to cmd.exe on its own.
+    $Mutation.DefaultShell = $prior
+    $Mutation.DefaultShellManaged = $true
 
     if ($prior -and $prior -ieq $CmdPath) {
         Write-Host "  Already $CmdPath"
@@ -431,10 +473,6 @@ function Set-SshDefaultShell {
             Write-Host "  Set to $CmdPath"
         }
     }
-
-    # A null prior records "the value did not exist", which -Disable restores
-    # by deleting it again -- sshd falls back to cmd.exe on its own.
-    $prior
 }
 
 function Restore-SshDefaultShell {
@@ -471,23 +509,98 @@ function Restore-SshDefaultShell {
     Write-Host "  Default shell restored to its previous value ($Value)."
 }
 
+function Get-PortCoverage {
+    param(
+        [AllowNull()]
+        [object]$LocalPort,
+
+        [Parameter(Mandatory = $true)]
+        [int[]]$Port
+    )
+
+    # A port filter is not always a number. -LocalPort takes a single port, a
+    # range, or a keyword, so an exact-string test misses a rule whose range
+    # spans the port and misses "Any" altogether -- and such a rule goes on
+    # holding the port open at its own scope while this script reports
+    # -ClientAddress as the boundary.
+    #
+    # "Specific" and "Any" are answered apart because they deserve different
+    # treatment: see Enable-RemoteMcpFirewall.
+    $sawAny = $false
+
+    foreach ($entry in @($LocalPort)) {
+        $text = "$entry".Trim()
+        if (-not $text) {
+            continue
+        }
+
+        if ($text -eq "Any") {
+            $sawAny = $true
+            continue
+        }
+
+        if ($text -match '^(\d+)\s*-\s*(\d+)$') {
+            $low = [int]$matches[1]
+            $high = [int]$matches[2]
+            foreach ($wanted in $Port) {
+                if ($wanted -ge $low -and $wanted -le $high) {
+                    return "Specific"
+                }
+            }
+
+            continue
+        }
+
+        $value = 0
+        if ([int]::TryParse($text, [ref]$value)) {
+            if ($Port -contains $value) {
+                return "Specific"
+            }
+
+            continue
+        }
+
+        # A service keyword -- RPC, RPCEPMap, IPHTTPS, Teredo -- names no fixed
+        # port to compare against, and none of them carry ssh.
+    }
+
+    if ($sawAny) {
+        return "Any"
+    }
+
+    "None"
+}
+
 function Get-CompetingSshRule {
     param(
         [Parameter(Mandatory = $true)]
-        [int[]]$Port
+        [int[]]$Port,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Specific", "Any")]
+        [string]$Coverage
     )
 
     # Windows Firewall allow rules are additive, so the rule the OpenSSH
     # capability installs keeps the port open at its own wider scope no matter
     # how narrow this script's rule is. Match on the port filter rather than on
     # rule names, which are localized and vary by Windows version.
-    $wantedPorts = @($Port | ForEach-Object { [string]$_ })
+    #
+    # Protocol "Any" counts too: a rule that names no protocol carries TCP
+    # along with everything else.
+    $filters = @(
+        Get-NetFirewallPortFilter -All |
+            Where-Object {
+                ("TCP", "Any") -contains "$($_.Protocol)" -and
+                (Get-PortCoverage -LocalPort $_.LocalPort -Port $Port) -eq $Coverage
+            }
+    )
 
-    Get-NetFirewallPortFilter -All |
-        Where-Object {
-            $_.Protocol -eq "TCP" -and
-            @($_.LocalPort | Where-Object { $wantedPorts -contains $_ }).Count -gt 0
-        } |
+    if ($filters.Count -eq 0) {
+        return
+    }
+
+    $filters |
         Get-NetFirewallRule |
         Where-Object {
             $_.Name -ne $SshRuleId -and
@@ -538,7 +651,16 @@ function Enable-RemoteMcpFirewall {
     # default port open wider than -ClientAddress says.
     $scopedPorts = @(@($Port, 22) | Select-Object -Unique)
 
-    foreach ($rule in Get-CompetingSshRule -Port $scopedPorts) {
+    # A rule whose filter is LocalPort "Any" is reported, not rescoped. It is
+    # usually scoped to a program or service instead of a port -- an app's
+    # inbound rule, not an ssh hole -- and narrowing every one of them to the
+    # ssh client would take the VM's other inbound traffic down with it. Say so
+    # and let the operator judge, rather than silently doing either.
+    foreach ($rule in Get-CompetingSshRule -Port $scopedPorts -Coverage Any) {
+        Write-Warning "  Not narrowed: '$($rule.DisplayName)' allows inbound TCP on ANY local port, so it may reach sshd from outside $($RemoteAddress -join ', '). Review it by hand."
+    }
+
+    foreach ($rule in Get-CompetingSshRule -Port $scopedPorts -Coverage Specific) {
         $priorAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
         $priorProfile = @("$($rule.Profile)" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         $priorEnabled = "$($rule.Enabled)"
@@ -746,7 +868,11 @@ function Restore-SshService {
         Set-Service -Name sshd -StartupType $startType
 
         if ($State.CapabilityInstalled -or -not $State.SshWasRunning) {
-            Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+            # No -ErrorAction SilentlyContinue: a suppressed failure here would
+            # print "stopped" over a service still running, skip the catch
+            # below, and let the state file be deleted with no record to retry
+            # from. Stopping an already-stopped service is not an error.
+            Stop-Service -Name sshd -Force
             Write-Host "  sshd stopped; startup type $startType."
         } else {
             Write-Host "  sshd left running; startup type restored to $startType."
@@ -915,9 +1041,7 @@ $mutation = [ordered]@{
 try {
     Write-Host "[1/4] OpenSSH Server:"
     $mutation.CapabilityInstalled = Install-OpenSshServer
-    $priorService = Start-SshService
-    $mutation.SshStartType = $priorService.StartType
-    $mutation.SshWasRunning = $priorService.WasRunning
+    Start-SshService -Mutation $mutation
 
     Write-Host ""
     Write-Host "[2/4] Firewall:"
@@ -938,8 +1062,7 @@ try {
         # never wrote is not one -Disable may delete.
         Write-Host "  Skipped (-SkipDefaultShell specified). An MCP transport needs cmd.exe here; PowerShell rewrites the stream."
     } else {
-        $mutation.DefaultShell = Set-SshDefaultShell
-        $mutation.DefaultShellManaged = $true
+        Set-SshDefaultShell -Mutation $mutation
     }
 
     Write-Host ""
