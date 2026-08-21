@@ -76,6 +76,15 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ServerCommand,
 
+    # Private key the printed client config points at. The key installed here
+    # is a public half that could have come from anywhere, so assuming its
+    # private half sits at the default path would hand out a config that
+    # authenticates as the wrong identity -- and BatchMode makes that a silent
+    # failure rather than a prompt.
+    [Parameter(ParameterSetName = "Enable")]
+    [ValidateNotNullOrEmpty()]
+    [string]$ClientIdentityFile = "~/.ssh/id_ed25519",
+
     # Name the printed client config uses for this VM, both as the ssh_config
     # Host alias and as the MCP server name.
     [Parameter(ParameterSetName = "Enable")]
@@ -162,7 +171,22 @@ function Save-RemoteMcpState {
         New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
     }
 
-    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $StatePath -Encoding UTF8
+    # Written beside the record and swapped in, never written over it. This is
+    # the only way back for a machine this script has changed, and a write
+    # interrupted half way -- a full disk, a reset VM -- would leave truncated
+    # JSON where the original firewall scope, shell and keys used to be. A
+    # failed write this way costs the update, not the record.
+    $temp = "$StatePath.new"
+    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $temp -Encoding UTF8
+
+    if (Test-Path $StatePath) {
+        # [NullString]::Value, not $null: PowerShell turns $null into an empty
+        # string when binding to a .NET string parameter, and Replace rejects
+        # that -- so every update after the first would fail here.
+        [System.IO.File]::Replace($temp, $StatePath, [NullString]::Value)
+    } else {
+        Move-Item -Path $temp -Destination $StatePath -Force
+    }
 }
 
 function Resolve-PublicKey {
@@ -447,15 +471,42 @@ function Remove-AuthorizedKey {
         return
     }
 
-    # Taking a line out means rewriting the file, so this keeps everything else
-    # exactly as it was -- other keys, comments, blank lines, and any non-ASCII
-    # in a comment field -- rather than passing it through Get-Content and
-    # Set-Content, which would trim and re-encode all of it.
+    # Byte for byte, because taking a line out means writing the file back and
+    # this one is not this script's to normalise. Decoding it and rejoining the
+    # lines would rewrite bytes that have nothing to do with the managed key: an
+    # LF file would come back CRLF, a missing final newline would be supplied,
+    # and anything that is not valid UTF-8 -- a comment in some other encoding
+    # -- would come back as replacement characters. Only the managed line's own
+    # bytes are cut out; every other byte is copied through untouched.
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    $text = [System.IO.File]::ReadAllText($Path, $utf8NoBom)
-    $kept = @(($text -split "`\r?`\n") | Where-Object { $_.Trim() -ne $Key })
+    $kept = New-Object System.IO.MemoryStream
+    $start = 0
 
-    [System.IO.File]::WriteAllText($Path, ($kept -join [Environment]::NewLine), $utf8NoBom)
+    for ($i = 0; $i -le $bytes.Length; $i++) {
+        # A line runs to the next LF, or to the end of the file.
+        if ($i -lt $bytes.Length -and $bytes[$i] -ne 10) {
+            continue
+        }
+
+        $end = [Math]::Min($i + 1, $bytes.Length)
+        $length = $end - $start
+
+        if ($length -gt 0) {
+            $line = New-Object byte[] $length
+            [System.Array]::Copy($bytes, $start, $line, 0, $length)
+
+            # Trim covers the CR of a CRLF ending as well as stray whitespace.
+            if ($utf8NoBom.GetString($line).Trim() -ne $Key) {
+                $kept.Write($bytes, $start, $length)
+            }
+        }
+
+        $start = $end
+    }
+
+    [System.IO.File]::WriteAllBytes($Path, $kept.ToArray())
+    $kept.Dispose()
     Write-Host "  Key removed from $Path"
 }
 
@@ -1461,7 +1512,7 @@ On the client, give this VM a stable name in ~/.ssh/config:
   Host $SshHostAlias
       HostName $sshHostName
       User $User$portLine
-      IdentityFile ~/.ssh/id_ed25519
+      IdentityFile $ClientIdentityFile
       RequestTTY no
       BatchMode yes
       ServerAliveInterval 30
