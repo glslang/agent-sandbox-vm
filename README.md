@@ -264,7 +264,10 @@ powershell -ExecutionPolicy RemoteSigned -File C:\Setup-RemoteMcp.ps1 `
 ```
 
 `-PublicKeyPath <file>` takes the key from a `.pub` file instead. `-ServerCommand` is only used to
-print the client-side registration, so it can be left off and filled in later. The run ends with the
+print the client-side registration, so it can be left off and filled in later, and
+`-ClientIdentityFile` names the private half in the printed `~/.ssh/config` block when it is not the
+default `~/.ssh/id_ed25519` -- with `BatchMode yes`, pointing at the wrong key fails authentication
+without a prompt. The run ends with the
 `~/.ssh/config` block, the handshake probe, and the `claude mcp add` line to paste on the client.
 
 Four things have to be true for this to work, and three of them fail silently, which is why they are
