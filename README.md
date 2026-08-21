@@ -283,7 +283,8 @@ scripted rather than described:
   Narrows, never widens: a rule scoped to `Any` becomes the allowlist, one already naming only
   addresses from it is left alone, one that overlaps is cut to the overlap, and one whose scope
   cannot be compared to the request without guessing at containment (`10.0.0.5` against
-  `LocalSubnet`) is left untouched and fails the run rather than being written over.
+  `LocalSubnet`) is left untouched and fails the run rather than being written over. A rule it does
+  not change it also does not record: a record is a claim of ownership, and `-Disable` acts on it.
   A rule counts as being on that port whether its filter names the port exactly or a range spanning
   it, and a rule that cannot be narrowed -- one managed by group policy, typically -- fails the run
   rather than letting it report a boundary the rule still overrides. One whose filter is `LocalPort Any` is never

@@ -480,28 +480,45 @@ function Add-AuthorizedKey {
         return $false
     }
 
-    # Appended, never rewritten. The file is not this script's to normalise: it
+    # Added, never rewritten. The file is not this script's to normalise: it
     # can hold other keys, comments, blank lines and non-ASCII in a comment
     # field, and rewriting every line -- which trimming and re-encoding amounts
     # to -- would destroy content nothing here records for -Disable to restore.
+    # So the existing bytes are carried across untouched and the new line is
+    # put after them.
     #
-    # UTF-8 without a BOM, written through .NET rather than Set-Content:
-    # Windows PowerShell's -Encoding UTF8 emits a BOM, which on a new file
-    # would sit in front of the first key and stop sshd reading it, and its
-    # default redirection encoding is UTF-16, which sshd cannot read at all.
+    # UTF-8 without a BOM: Windows PowerShell's -Encoding UTF8 emits one, which
+    # on a new file would sit in front of the first key and stop sshd reading
+    # it, and its default redirection encoding is UTF-16, which sshd cannot
+    # read at all.
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    # Assigned in two steps on purpose: an empty array coming out of an `if`
+    # expression is unrolled to nothing, which leaves $null rather than a
+    # zero-length byte[], and Array::Copy will not take that.
+    $existingBytes = [byte[]]@()
+    if (Test-Path $Path) {
+        $existingBytes = [System.IO.File]::ReadAllBytes($Path)
+    }
 
     # A file whose last line has no newline would otherwise get this key glued
     # onto the end of it. Checked as bytes, so no encoding guess is involved.
     $separator = ""
-    if (Test-Path $Path) {
-        $bytes = [System.IO.File]::ReadAllBytes($Path)
-        if ($bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -ne 10) {
-            $separator = [Environment]::NewLine
-        }
+    if ($existingBytes.Length -gt 0 -and $existingBytes[$existingBytes.Length - 1] -ne 10) {
+        $separator = [Environment]::NewLine
     }
 
-    [System.IO.File]::AppendAllText($Path, $separator + $Key + [Environment]::NewLine, $utf8NoBom)
+    # Swapped in rather than appended in place. An append that failed part way
+    # could leave a complete, working key line in the file while throwing --
+    # and a key sshd accepts that this run never got to record is one -Disable
+    # will never remove. Either the whole line is there and recorded, or
+    # neither.
+    $addition = $utf8NoBom.GetBytes($separator + $Key + [Environment]::NewLine)
+    $combined = New-Object byte[] ($existingBytes.Length + $addition.Length)
+    [System.Array]::Copy($existingBytes, 0, $combined, 0, $existingBytes.Length)
+    [System.Array]::Copy($addition, 0, $combined, $existingBytes.Length, $addition.Length)
+
+    Set-FileContentAtomically -Path $Path -Bytes $combined
     Write-Host "  Key added to $Path"
     $true
 }
@@ -1090,12 +1107,21 @@ function Enable-RemoteMcpFirewall {
             }
         }
 
+        # Nothing to do: the rule is already inside what was asked for, on a
+        # profile that was asked for, so this run does not touch it -- and must
+        # not record it either. A record is a claim of ownership, and -Disable
+        # acts on it: an untouched rule that someone later disables would be
+        # re-enabled from a value this script never set.
+        if (-not $narrowedAddress -and -not $narrowedProfile -and -not $disableRule) {
+            Write-Host "  Left as it is, already within the requested scope: $($rule.DisplayName)"
+            continue
+        }
+
         # Recorded before the first call that changes anything, not after the
         # last. Narrowing a rule can take two calls -- the address, then the
         # profile or the enabled flag -- and the second throwing with the first
         # applied would otherwise leave the rule changed with its original
-        # address written down nowhere. Restoring a rule this loop never got to
-        # is a no-op; restoring one it half-changed is the whole point.
+        # address written down nowhere.
         [void]$AdjustedRule.Add([pscustomobject]@{
             Name          = $rule.Name
             RemoteAddress = $priorAddress
@@ -1588,7 +1614,27 @@ if ($Disable) {
                 Write-Warning "$StatePath still describes the state before this run and now over-describes it: it lists components this run already restored. Rerunning -Disable against it would try to put those back a second time. Not put back this run: $($script:UnfinishedRestore -join '; '). Reconcile or remove that file before rerunning."
             }
         } else {
-            Remove-Item -Path $StatePath -Force
+            # Everything is back, so the record should go. If it cannot be
+            # deleted -- locked, or its directory no longer writable -- leaving
+            # the full one behind would tell a later -Disable that all of it is
+            # still outstanding, and it would put those values back over
+            # whatever has happened since. Empty it instead: a record that
+            # claims nothing is one a later run reads and acts on correctly.
+            try {
+                Remove-Item -Path $StatePath -Force
+            } catch {
+                Write-Warning "Could not remove $StatePath ($($_.Exception.Message)); emptying it instead so a later -Disable does not act on it."
+                try {
+                    $remaining.AuthorizedKeysAcls = @()
+                    $remaining.AdjustedRules = @()
+                    $remaining.AuthorizedKeys = @()
+                    Save-RemoteMcpState -State $remaining
+                    Write-Host "  $StatePath emptied; it records nothing outstanding. Remove it when you can."
+                } catch {
+                    $script:RestoreFailed = $true
+                    Write-Warning "Could not empty $StatePath either ($($_.Exception.Message)). It still describes the state before this run, and a later -Disable reading it would try to restore components this run already put back. Remove that file by hand."
+                }
+            }
         }
     }
 
