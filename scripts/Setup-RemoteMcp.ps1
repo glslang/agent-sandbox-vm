@@ -61,6 +61,15 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 22,
 
+    # Which authorized-keys file sshd will read for -User. Auto works it out
+    # from Administrators membership, which is what sshd itself goes by, and
+    # refuses to guess when a group in that chain cannot be expanded -- name
+    # the file yourself in that case. Getting it wrong is not an error
+    # anywhere; it is a login that never authenticates.
+    [Parameter(ParameterSetName = "Enable")]
+    [ValidateSet("Auto", "Administrators", "PerUser")]
+    [string]$AuthorizedKeysFile = "Auto",
+
     # Path to the MCP server on this VM, e.g. C:\tools\windbg-mcp.exe. Used
     # only to print the client-side registration and handshake probe.
     [Parameter(ParameterSetName = "Enable")]
@@ -222,9 +231,17 @@ function Test-UserIsAdministrator {
     # so walk the nesting: a user who is an administrator through a group would
     # otherwise get a confident "no", the key would go to the per-user file
     # while sshd read the administrators one, and every login would fail.
+    #
+    # A group that cannot be expanded does not end the walk. Domain groups sit
+    # in Administrators on any domain-joined machine and none of them are local
+    # groups, so bailing out there would answer "administrator" for every
+    # account on the machine, standard users included -- trading one wrong
+    # answer for a much more common one. Carry on, and report Unknown only if
+    # the user was not found anywhere that could be read.
     $pending = New-Object System.Collections.Queue
     $pending.Enqueue($AdministratorsSid)
     $seen = @{}
+    $unresolved = @()
 
     while ($pending.Count -gt 0) {
         $groupSid = "$($pending.Dequeue())"
@@ -237,17 +254,13 @@ function Test-UserIsAdministrator {
         try {
             $members = @(Get-LocalGroupMember -SID $groupSid -ErrorAction Stop)
         } catch {
-            # A domain group among the members is the ordinary case here: it is
-            # not a local group, so this cannot expand it. Undetermined, and
-            # the caller prints which file it settled on so a wrong guess is
-            # visible rather than silent.
-            Write-Warning "  Could not expand group $groupSid ($($_.Exception.Message)); assuming '$Name' is an administrator."
-            return $true
+            $unresolved += $groupSid
+            continue
         }
 
         foreach ($member in $members) {
             if ("$($member.SID)" -eq $Sid) {
-                return $true
+                return [pscustomobject]@{ Result = "Yes"; Unresolved = @() }
             }
 
             if ("$($member.ObjectClass)" -eq "Group") {
@@ -256,7 +269,11 @@ function Test-UserIsAdministrator {
         }
     }
 
-    $false
+    if ($unresolved.Count -gt 0) {
+        return [pscustomobject]@{ Result = "Unknown"; Unresolved = $unresolved }
+    }
+
+    [pscustomobject]@{ Result = "No"; Unresolved = @() }
 }
 
 function Get-UserProfilePath {
@@ -286,7 +303,15 @@ function Set-AuthorizedKeysAcl {
         [bool]$IsAdministratorsFile,
 
         [Parameter(Mandatory = $true)]
-        [string]$OwnerSid
+        [string]$OwnerSid,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Mutation,
+
+        # $false when this run created the file, in which case there is no
+        # prior DACL to put back.
+        [Parameter(Mandatory = $true)]
+        [bool]$FileExisted
     )
 
     # sshd refuses an authorized-keys file any other principal can write, and
@@ -310,6 +335,19 @@ function Set-AuthorizedKeysAcl {
     }
 
     $acl = Get-Acl -Path $Path
+
+    # Rebuilding is destructive -- an explicit entry another account or a
+    # management tool relied on goes with it -- so the DACL this replaces is
+    # recorded first, and -Disable puts it back. Only the DACL: the owner and
+    # the audit entries are not touched, so restoring them is not this
+    # script's business either. Recorded before the rebuild, like every other
+    # change here, and only when there was something to record.
+    if ($FileExisted -and -not $Mutation.AuthorizedKeysAcl) {
+        $Mutation.AuthorizedKeysAcl = [pscustomobject]@{
+            Path = $Path
+            Sddl = $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
+        }
+    }
 
     # $true: protect from inheritance. $false: do not copy the inherited
     # entries down as explicit ones -- they leave the in-memory DACL here, so
@@ -683,6 +721,19 @@ function Enable-RemoteMcpFirewall {
             }
         }
 
+        # Recorded before the first call that changes anything, not after the
+        # last. Narrowing a rule can take two calls -- the address, then the
+        # profile or the enabled flag -- and the second throwing with the first
+        # applied would otherwise leave the rule changed with its original
+        # address written down nowhere. Restoring a rule this loop never got to
+        # is a no-op; restoring one it half-changed is the whole point.
+        [void]$AdjustedRule.Add([pscustomobject]@{
+            Name          = $rule.Name
+            RemoteAddress = $priorAddress
+            Profile       = $priorProfile
+            Enabled       = $priorEnabled
+        })
+
         try {
             Set-NetFirewallRule -Name $rule.Name -RemoteAddress $RemoteAddress
 
@@ -697,13 +748,6 @@ function Enable-RemoteMcpFirewall {
             Write-Warning "  Could not narrow existing SSH exception '$($rule.DisplayName)': $($_.Exception.Message)"
             continue
         }
-
-        [void]$AdjustedRule.Add([pscustomobject]@{
-            Name          = $rule.Name
-            RemoteAddress = $priorAddress
-            Profile       = $priorProfile
-            Enabled       = $priorEnabled
-        })
 
         if ($disableRule) {
             Write-Host "  Disabled existing SSH exception outside the requested profiles: $($rule.DisplayName) (was $($priorProfile -join ', '))"
@@ -778,6 +822,7 @@ function Save-EnableState {
             SshStartType        = $Mutation.SshStartType
             SshWasRunning       = $Mutation.SshWasRunning
             CapabilityInstalled = $Mutation.CapabilityInstalled
+            AuthorizedKeysAcl   = $Mutation.AuthorizedKeysAcl
             AdjustedRules       = @($Mutation.AdjustedRules)
             AuthorizedKeys      = @($Mutation.AuthorizedKeys)
         })
@@ -794,12 +839,17 @@ function Save-EnableState {
     $defaultShell = if ($state.DefaultShellManaged) { $state.DefaultShell } else { $Mutation.DefaultShell }
     $serviceKnown = $null -ne $state.SshStartType
 
+    # The first rebuild is the one that saw the machine's own DACL; a rerun
+    # would only capture what this script already wrote.
+    $keysAcl = if ($state.AuthorizedKeysAcl) { $state.AuthorizedKeysAcl } else { $Mutation.AuthorizedKeysAcl }
+
     Save-RemoteMcpState -State ([ordered]@{
         DefaultShell        = $defaultShell
         DefaultShellManaged = ([bool]$state.DefaultShellManaged -or $Mutation.DefaultShellManaged)
         SshStartType        = $(if ($serviceKnown) { $state.SshStartType } else { $Mutation.SshStartType })
         SshWasRunning       = $(if ($serviceKnown) { $state.SshWasRunning } else { $Mutation.SshWasRunning })
         CapabilityInstalled = ([bool]$state.CapabilityInstalled -or $Mutation.CapabilityInstalled)
+        AuthorizedKeysAcl   = $keysAcl
         AdjustedRules       = @(@($state.AdjustedRules) + @($Mutation.AdjustedRules | Where-Object { $knownRules -notcontains $_.Name }))
         AuthorizedKeys      = @(@($state.AuthorizedKeys) + @($Mutation.AuthorizedKeys | Where-Object { $knownKeys -notcontains "$($_.Path)|$($_.Key)" }))
     })
@@ -846,6 +896,25 @@ function Disable-RemoteMcpFirewall {
             $script:UnfinishedRestore += "firewall rule $($record.Name)"
         }
     }
+}
+
+function Restore-AuthorizedKeysAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Record
+    )
+
+    if (-not (Test-Path $Record.Path)) {
+        Write-Host "  Authorized keys file already gone; ACL not restored: $($Record.Path)"
+        return
+    }
+
+    # Only the DACL, which is the only part the rebuild replaced.
+    $acl = Get-Acl -Path $Record.Path
+    $acl.SetSecurityDescriptorSddlForm($Record.Sddl, [System.Security.AccessControl.AccessControlSections]::Access)
+    Set-Acl -Path $Record.Path -AclObject $acl
+
+    Write-Host "  ACL restored on $($Record.Path)"
 }
 
 function Restore-SshService {
@@ -972,6 +1041,19 @@ if ($Disable) {
         Write-Host "  No saved state; authorized keys left alone."
     }
 
+    # After the keys, not before: removing them needs the write access this is
+    # about to give away.
+    if ($SkipKeys) {
+        # The keys are still in the file, so the ACL that protects them stays.
+    } elseif ($state -and $state.AuthorizedKeysAcl) {
+        try {
+            Restore-AuthorizedKeysAcl -Record $state.AuthorizedKeysAcl
+        } catch {
+            Write-Warning "  Could not restore the ACL on '$($state.AuthorizedKeysAcl.Path)': $($_.Exception.Message)"
+            $script:UnfinishedRestore += "the ACL on $($state.AuthorizedKeysAcl.Path)"
+        }
+    }
+
     Restore-SshService -State $state
 
     if ($state) {
@@ -1007,12 +1089,35 @@ if ($ServerCommand -and -not (Test-Path $ServerCommand)) {
 # firewall and the default shell had been altered would leave a machine this
 # script had changed with nothing recorded to change back.
 $userSid = Get-UserSid -Name $User
-$userIsAdministrator = Test-UserIsAdministrator -Name $User -Sid $userSid
 
 # sshd ignores ~/.ssh/authorized_keys for a member of the Administrators group
 # and reads the ProgramData file instead -- which it will be on a VM used for
-# kernel debugging. A key in the wrong file is not an error anywhere; it is
-# just a login that never authenticates.
+# kernel debugging.
+if ($AuthorizedKeysFile -eq "Auto") {
+    $membership = Test-UserIsAdministrator -Name $User -Sid $userSid
+
+    if ($membership.Result -eq "Unknown") {
+        # Neither answer is safe to guess here. The key in the wrong file fails
+        # every login; the administrators file for a non-administrator would on
+        # top of that authorize a login this script was never asked to grant.
+        # So say what could not be read and let the caller settle it.
+        throw @"
+Could not tell whether '$User' is an administrator, so which file sshd will read is unknown.
+These groups in the Administrators chain could not be expanded (a domain group is the usual reason):
+  $($membership.Unresolved -join "`n  ")
+Rerun naming the file yourself:
+  -AuthorizedKeysFile Administrators   for an account in the Administrators group
+                                       ($AdministratorsKeyFile)
+  -AuthorizedKeysFile PerUser          for a standard account
+                                       (its own .ssh\authorized_keys)
+"@
+    }
+
+    $userIsAdministrator = ($membership.Result -eq "Yes")
+} else {
+    $userIsAdministrator = ($AuthorizedKeysFile -eq "Administrators")
+}
+
 $authorizedKeysPath = if ($userIsAdministrator) {
     $AdministratorsKeyFile
 } else {
@@ -1034,6 +1139,7 @@ $mutation = [ordered]@{
     SshStartType        = $null
     SshWasRunning       = $null
     CapabilityInstalled = $false
+    AuthorizedKeysAcl   = $null
     AdjustedRules       = New-Object System.Collections.ArrayList
     AuthorizedKeys      = New-Object System.Collections.ArrayList
 }
@@ -1077,13 +1183,22 @@ try {
             New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
         }
 
+        # Asked before the key is written, since writing it creates the file.
+        $keyFileExisted = Test-Path $authorizedKeysPath
+
         # Recorded before the ACL call, which can throw with the key already on
         # disk -- a key installed and not recorded is one -Disable never removes.
         if (Add-AuthorizedKey -Path $authorizedKeysPath -Key $resolvedKey) {
             [void]$mutation.AuthorizedKeys.Add([pscustomobject]@{ Path = $authorizedKeysPath; Key = $resolvedKey })
         }
 
-        Set-AuthorizedKeysAcl -Path $authorizedKeysPath -IsAdministratorsFile $userIsAdministrator -OwnerSid $userSid
+        Set-AuthorizedKeysAcl `
+            -Path $authorizedKeysPath `
+            -IsAdministratorsFile $userIsAdministrator `
+            -OwnerSid $userSid `
+            -Mutation $mutation `
+            -FileExisted $keyFileExisted
+
         Write-Host "  ACL tightened on $authorizedKeysPath"
     }
 } finally {
@@ -1119,7 +1234,12 @@ if (-not (Test-PortListening -Port $Port)) {
 }
 
 $sshHostName = if ($vmAddresses.Count -gt 0) { $vmAddresses[0] } else { "<vm-address>" }
+# Quoted twice on purpose. ssh joins its remaining arguments into ONE string
+# and hands that to the remote shell, so the client shell's own quotes are gone
+# by then -- a path with a space would reach cmd.exe bare and run only the part
+# before the first space. The inner double quotes are what survives the trip.
 $remoteCommand = if ($ServerCommand) { $ServerCommand } else { "<path-to-mcp-server.exe>" }
+$remoteCommand = '"' + $remoteCommand + '"' 
 $portLine = if ($Port -ne 22) { "`n      Port $Port" } else { "" }
 $probeJson = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
 
