@@ -434,6 +434,25 @@ function Set-AuthorizedKeysAcl {
     Set-Acl -Path $Path -AclObject $acl
 }
 
+function Get-AuthorizedKeyIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Line
+    )
+
+    # sshd authenticates on the key type and the base64 blob. The rest of the
+    # line is a comment it does not read, so two lines differing only there are
+    # the same credential -- and comparing whole lines would let an edited
+    # comment hide a key this script installed from its own removal.
+    $fields = @("$Line".Trim() -split "\s+" | Where-Object { $_ })
+    if ($fields.Count -lt 2) {
+        return $null
+    }
+
+    "$($fields[0]) $($fields[1])"
+}
+
 function Add-AuthorizedKey {
     param(
         [Parameter(Mandatory = $true)]
@@ -475,9 +494,12 @@ function Add-AuthorizedKey {
         @()
     }
 
-    if ($existing -contains $Key) {
-        Write-Host "  Key already present in $Path"
-        return $false
+    $identity = Get-AuthorizedKeyIdentity -Line $Key
+    foreach ($line in $existing) {
+        if ((Get-AuthorizedKeyIdentity -Line $line) -eq $identity) {
+            Write-Host "  Key already present in $Path"
+            return [pscustomobject]@{ Added = $false; AddedSeparator = $false }
+        }
     }
 
     # Added, never rewritten. The file is not this script's to normalise: it
@@ -520,7 +542,9 @@ function Add-AuthorizedKey {
 
     Set-FileContentAtomically -Path $Path -Bytes $combined
     Write-Host "  Key added to $Path"
-    $true
+
+    # Whether a terminator had to be inserted, so -Disable can take it back out.
+    [pscustomobject]@{ Added = $true; AddedSeparator = [bool]$separator }
 }
 
 function Remove-AuthorizedKey {
@@ -529,7 +553,12 @@ function Remove-AuthorizedKey {
         [string]$Path,
 
         [Parameter(Mandatory = $true)]
-        [string]$Key
+        [string]$Key,
+
+        # True when adding this key had to terminate the file's previous last
+        # line, which had none. That newline is this run's too, so it comes
+        # back out with the key.
+        [bool]$AddedSeparator = $false
     )
 
     if (-not (Test-Path $Path)) {
@@ -547,6 +576,8 @@ function Remove-AuthorizedKey {
     $bytes = [System.IO.File]::ReadAllBytes($Path)
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $kept = New-Object System.IO.MemoryStream
+    $identity = Get-AuthorizedKeyIdentity -Line $Key
+    $removed = $false
     $start = 0
 
     for ($i = 0; $i -le $bytes.Length; $i++) {
@@ -562,8 +593,11 @@ function Remove-AuthorizedKey {
             $line = New-Object byte[] $length
             [System.Array]::Copy($bytes, $start, $line, 0, $length)
 
-            # Trim covers the CR of a CRLF ending as well as stray whitespace.
-            if ($utf8NoBom.GetString($line).Trim() -ne $Key) {
+            # By identity, not by the whole line: an edited comment must not
+            # stop this from finding a key it installed.
+            if ((Get-AuthorizedKeyIdentity -Line $utf8NoBom.GetString($line)) -eq $identity) {
+                $removed = $true
+            } else {
                 $kept.Write($bytes, $start, $length)
             }
         }
@@ -571,11 +605,33 @@ function Remove-AuthorizedKey {
         $start = $end
     }
 
+    $result = $kept.ToArray()
+    $kept.Dispose()
+
+    if (-not $removed) {
+        Write-Host "  Key not found in $Path; nothing to remove."
+        return
+    }
+
+    # The terminator this run put on the file's previous last line goes back
+    # out with the key, so the file ends where it did before. If something else
+    # has been appended since, the byte removed is that line's terminator
+    # instead -- one trailing newline either way, which sshd does not require.
+    if ($AddedSeparator -and $result.Length -gt 0 -and $result[$result.Length - 1] -eq 10) {
+        $trim = 1
+        if ($result.Length -gt 1 -and $result[$result.Length - 2] -eq 13) {
+            $trim = 2
+        }
+
+        $shortened = New-Object byte[] ($result.Length - $trim)
+        [System.Array]::Copy($result, 0, $shortened, 0, $shortened.Length)
+        $result = $shortened
+    }
+
     # Swapped in rather than written over: unrelated keys and comments in this
     # file are not recorded anywhere, so a half-written file would lose them
     # with nothing able to put them back.
-    Set-FileContentAtomically -Path $Path -Bytes $kept.ToArray()
-    $kept.Dispose()
+    Set-FileContentAtomically -Path $Path -Bytes $result
     Write-Host "  Key removed from $Path"
 }
 
@@ -1227,6 +1283,53 @@ Nothing after the firewall step was configured. -Disable puts back what this run
     }
 }
 
+function Merge-AdjustedRules {
+    param(
+        [AllowNull()]
+        [object]$Stored,
+
+        [AllowNull()]
+        [object]$Applied
+    )
+
+    # The prior values belong to the first run that touched a rule -- they are
+    # what -Disable puts back. The APPLIED values belong to the latest run,
+    # because they are what the rule should look like now: a rerun that narrows
+    # a rule further leaves it in a state the stored applied values no longer
+    # describe, and -Disable would then read this script's own second narrowing
+    # as somebody else's edit and abandon the rule.
+    $merged = @()
+    $seen = @{}
+
+    foreach ($record in @(@($Stored) | Where-Object { $_ })) {
+        $latest = @(@($Applied) | Where-Object { $_ -and $_.Name -eq $record.Name }) | Select-Object -First 1
+
+        if ($latest) {
+            $merged += [pscustomobject]@{
+                Name                 = $record.Name
+                RemoteAddress        = $record.RemoteAddress
+                Profile              = $record.Profile
+                Enabled              = $record.Enabled
+                AppliedRemoteAddress = $latest.AppliedRemoteAddress
+                AppliedProfile       = $latest.AppliedProfile
+                AppliedEnabled       = $latest.AppliedEnabled
+            }
+        } else {
+            $merged += $record
+        }
+
+        $seen[$record.Name] = $true
+    }
+
+    foreach ($record in @(@($Applied) | Where-Object { $_ })) {
+        if (-not $seen.ContainsKey($record.Name)) {
+            $merged += $record
+        }
+    }
+
+    $merged
+}
+
 function Save-EnableState {
     param(
         [Parameter(Mandatory = $true)]
@@ -1262,7 +1365,6 @@ function Save-EnableState {
         return
     }
 
-    $knownRules = @(@($state.AdjustedRules) | ForEach-Object { $_.Name })
     $knownKeys = @(@($state.AuthorizedKeys) | ForEach-Object { "$($_.Path)|$($_.Key)" })
 
     # A stored value for a component an earlier run never touched is not an
@@ -1284,7 +1386,7 @@ function Save-EnableState {
         CapabilityInstalled = ([bool]$state.CapabilityInstalled -or $Mutation.CapabilityInstalled)
         DefaultShellCommandOption = $(if ($state.DefaultShellManaged) { $state.DefaultShellCommandOption } else { $Mutation.DefaultShellCommandOption })
         AuthorizedKeysAcls  = @(@($state.AuthorizedKeysAcls) + @($Mutation.AuthorizedKeysAcls | Where-Object { $knownAclPaths -notcontains $_.Path }))
-        AdjustedRules       = @(@($state.AdjustedRules) + @($Mutation.AdjustedRules | Where-Object { $knownRules -notcontains $_.Name }))
+        AdjustedRules       = @(Merge-AdjustedRules -Stored $state.AdjustedRules -Applied $Mutation.AdjustedRules)
         AuthorizedKeys      = @(@($state.AuthorizedKeys) + @($Mutation.AuthorizedKeys | Where-Object { $knownKeys -notcontains "$($_.Path)|$($_.Key)" }))
     })
 }
@@ -1370,14 +1472,32 @@ function Disable-RemoteMcpFirewall {
             continue
         }
 
+        # Each step that succeeds moves the record's idea of the rule's current
+        # state forward. Without that, a retry after a half-finished restore
+        # would compare the rule against what enable applied, find the part
+        # already put back, and take this script's own work for somebody
+        # else's edit -- abandoning the rest.
+        $progress = [pscustomobject]@{
+            Name                 = $record.Name
+            RemoteAddress        = $record.RemoteAddress
+            Profile              = $record.Profile
+            Enabled              = $record.Enabled
+            AppliedRemoteAddress = $record.AppliedRemoteAddress
+            AppliedProfile       = $record.AppliedProfile
+            AppliedEnabled       = $record.AppliedEnabled
+        }
+
         try {
             Set-NetFirewallRule -Name $record.Name -RemoteAddress @($record.RemoteAddress)
+            $progress.AppliedRemoteAddress = $record.RemoteAddress
 
             if ($record.Profile) {
                 Set-NetFirewallRule -Name $record.Name -Profile @($record.Profile)
+                $progress.AppliedProfile = $record.Profile
             }
             if ($record.Enabled) {
                 Set-NetFirewallRule -Name $record.Name -Enabled $record.Enabled
+                $progress.AppliedEnabled = $record.Enabled
             }
 
             Write-Host "  Restored SSH exception: $($record.Name) ($(@($record.RemoteAddress) -join ', ')$(if ($record.Profile) { " on $(@($record.Profile) -join ', ')" }))"
@@ -1385,7 +1505,7 @@ function Disable-RemoteMcpFirewall {
             Write-Warning "  Could not restore '$($record.Name)': $($_.Exception.Message)"
             $script:UnfinishedRestore += "firewall rule $($record.Name)"
             $script:RestoreFailed = $true
-            [void]$Remaining.Add($record)
+            [void]$Remaining.Add($progress)
         }
     }
 }
@@ -1589,7 +1709,7 @@ if ($Disable) {
 
         foreach ($record in $records) {
             try {
-                Remove-AuthorizedKey -Path $record.Path -Key $record.Key
+                Remove-AuthorizedKey -Path $record.Path -Key $record.Key -AddedSeparator ([bool]$record.AddedSeparator)
             } catch {
                 Write-Warning "  Could not remove key from '$($record.Path)': $($_.Exception.Message)"
                 $script:UnfinishedRestore += "key in $($record.Path)"
@@ -1844,8 +1964,13 @@ try {
 
         # Recorded before the ACL call, which can throw with the key already on
         # disk -- a key installed and not recorded is one -Disable never removes.
-        if (Add-AuthorizedKey -Path $authorizedKeysPath -Key $resolvedKey) {
-            [void]$mutation.AuthorizedKeys.Add([pscustomobject]@{ Path = $authorizedKeysPath; Key = $resolvedKey })
+        $added = Add-AuthorizedKey -Path $authorizedKeysPath -Key $resolvedKey
+        if ($added.Added) {
+            [void]$mutation.AuthorizedKeys.Add([pscustomobject]@{
+                Path           = $authorizedKeysPath
+                Key            = $resolvedKey
+                AddedSeparator = $added.AddedSeparator
+            })
         }
 
         Set-AuthorizedKeysAcl `
