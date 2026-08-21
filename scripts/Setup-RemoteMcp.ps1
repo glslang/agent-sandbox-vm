@@ -438,6 +438,32 @@ function Add-AuthorizedKey {
         [string]$Key
     )
 
+    # A byte-order mark means this file is not what sshd reads. Windows
+    # PowerShell's redirection writes UTF-16 by default, and Get-Content
+    # decodes that quite happily -- so the duplicate check below would pass
+    # while appending UTF-8 bytes onto a UTF-16 stream produced a file sshd
+    # cannot parse at all, with the run reporting success over it.
+    if (Test-Path $Path) {
+        $head = [System.IO.File]::ReadAllBytes($Path)
+        $encoding = $null
+
+        if ($head.Length -ge 4 -and $head[0] -eq 0xFF -and $head[1] -eq 0xFE -and $head[2] -eq 0x00 -and $head[3] -eq 0x00) {
+            $encoding = "UTF-32 little-endian"
+        } elseif ($head.Length -ge 4 -and $head[0] -eq 0x00 -and $head[1] -eq 0x00 -and $head[2] -eq 0xFE -and $head[3] -eq 0xFF) {
+            $encoding = "UTF-32 big-endian"
+        } elseif ($head.Length -ge 2 -and $head[0] -eq 0xFF -and $head[1] -eq 0xFE) {
+            $encoding = "UTF-16 little-endian"
+        } elseif ($head.Length -ge 2 -and $head[0] -eq 0xFE -and $head[1] -eq 0xFF) {
+            $encoding = "UTF-16 big-endian"
+        } elseif ($head.Length -ge 3 -and $head[0] -eq 0xEF -and $head[1] -eq 0xBB -and $head[2] -eq 0xBF) {
+            $encoding = "UTF-8"
+        }
+
+        if ($encoding) {
+            throw "$Path starts with a $encoding byte-order mark. sshd reads this file as plain bytes, so it is already not being read the way it looks, and appending to it would make a file in two encodings. Convert it first -- read it, then write it back without a BOM -- and rerun."
+        }
+    }
+
     $existing = if (Test-Path $Path) {
         @(Get-Content -Path $Path | ForEach-Object { $_.Trim() })
     } else {
@@ -765,6 +791,42 @@ function Get-PortCoverage {
     "None"
 }
 
+function Get-SshdReachReason {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Rule
+    )
+
+    # A rule on LocalPort Any covers ssh's port, but covering the port is not
+    # the same as reaching sshd: most such rules are scoped to one program or
+    # one service, which is why they are not rescoped. That was an assumption
+    # until now -- ask instead. It reaches sshd only if BOTH filters admit it.
+    try {
+        $program = "$(($Rule | Get-NetFirewallApplicationFilter).Program)"
+        $service = "$(($Rule | Get-NetFirewallServiceFilter).Service)"
+    } catch {
+        # A filter that cannot be read cannot be shown to exclude sshd.
+        Write-Warning "  Could not read the program or service filter on '$($Rule.DisplayName)': $($_.Exception.Message)"
+        return "allows any local port, and its program and service filters could not be read"
+    }
+
+    # $null when the rule cannot reach sshd; otherwise why it can, which is
+    # what the operator needs in order to do something about it.
+    $boundToSshd = ($program -match 'sshd\.exe$') -or ($service -eq "sshd")
+    $programAdmits = (-not $program) -or $program -eq "Any" -or ($program -match 'sshd\.exe$')
+    $serviceAdmits = (-not $service) -or $service -eq "Any" -or ($service -eq "sshd")
+
+    if (-not ($programAdmits -and $serviceAdmits)) {
+        return $null
+    }
+
+    if ($boundToSshd) {
+        return "allows any local port and is bound to sshd itself"
+    }
+
+    "allows any local port and is bound to no program or service that would exclude sshd"
+}
+
 function Get-CompetingSshRule {
     param(
         [Parameter(Mandatory = $true)]
@@ -850,13 +912,20 @@ function Enable-RemoteMcpFirewall {
     # inbound rule, not an ssh hole -- and narrowing every one of them to the
     # ssh client would take the VM's other inbound traffic down with it. Say so
     # and let the operator judge, rather than silently doing either.
-    foreach ($rule in Get-CompetingSshRule -Port $scopedPorts -Coverage Any) {
-        Write-Warning "  Not narrowed: '$($rule.DisplayName)' allows inbound TCP on ANY local port, so it may reach sshd from outside $($RemoteAddress -join ', '). Review it by hand."
-    }
-
-    # Exceptions this run could not narrow. -ClientAddress is the whole claim
-    # this step makes, so a rule left wide is not a warning to read past.
+    # Exceptions that still reach sshd more widely than -ClientAddress asked
+    # for. That is the whole claim this step makes, so any of these is a
+    # failure rather than a warning to read past.
     $unnarrowed = @()
+
+    foreach ($rule in Get-CompetingSshRule -Port $scopedPorts -Coverage Any) {
+        $reason = Get-SshdReachReason -Rule $rule
+        if ($reason) {
+            Write-Warning "  Reaches sshd and is not narrowed: '$($rule.DisplayName)' -- $reason"
+            $unnarrowed += "$($rule.DisplayName) ($($rule.Name)) -- $reason"
+        } else {
+            Write-Host "  Ignored: '$($rule.DisplayName)' allows any local port but is bound to another program or service, so it cannot reach sshd."
+        }
+    }
 
     foreach ($rule in Get-CompetingSshRule -Port $scopedPorts -Coverage Specific) {
         $priorAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
@@ -972,9 +1041,9 @@ function Enable-RemoteMcpFirewall {
     # be claiming a boundary that is not there.
     if ($unnarrowed.Count -gt 0) {
         throw @"
-Could not narrow $($unnarrowed.Count) existing inbound exception(s) on this port, so -ClientAddress is not the boundary it would have reported:
+$($unnarrowed.Count) existing inbound exception(s) still reach sshd more widely than -ClientAddress, so that is not the boundary this run would have reported:
   $($unnarrowed -join "`n  ")
-These are usually managed by group policy, which cannot be edited on the machine itself. Narrow or disable them where they are defined and rerun, or rerun with -SkipFirewall if the wider exposure is deliberate.
+A rule that would not narrow is usually managed by group policy, which cannot be edited on the machine itself. A rule on any local port is not narrowed on purpose -- rescoping it would take this VM's other inbound traffic with it. Either way: narrow or disable them where they are defined and rerun, or rerun with -SkipFirewall if the wider exposure is deliberate.
 Nothing after the firewall step was configured. -Disable puts back what this run did change.
 "@
     }
@@ -1271,6 +1340,10 @@ if ($Disable) {
         }
     }
 
+    # Files still holding a managed key after this step. Their ACLs stay
+    # tightened: see below.
+    $keysOutstanding = @()
+
     if ($SkipKeys) {
         Write-Host "  Left installed keys in place (-SkipKeys specified)."
         $script:UnfinishedRestore += "the installed keys (-SkipKeys)"
@@ -1290,6 +1363,7 @@ if ($Disable) {
                 Write-Warning "  Could not remove key from '$($record.Path)': $($_.Exception.Message)"
                 $script:UnfinishedRestore += "key in $($record.Path)"
                 [void]$remaining.AuthorizedKeys.Add($record)
+                $keysOutstanding += $record.Path
             }
         }
     } else {
@@ -1305,6 +1379,18 @@ if ($Disable) {
         }
     } elseif ($state) {
         foreach ($record in @(@($state.AuthorizedKeysAcls) | Where-Object { $_ })) {
+            # Only for a file whose managed key is actually gone. Handing back
+            # a DACL that let another principal write, while a login key this
+            # script installed is still in the file, would leave that principal
+            # able to edit live credentials -- so the tightened ACL stays until
+            # the key it protects has been removed.
+            if ($keysOutstanding -contains $record.Path) {
+                Write-Host "  ACL left tightened on $($record.Path); the key in it is still installed."
+                $script:UnfinishedRestore += "the ACL on $($record.Path)"
+                [void]$remaining.AuthorizedKeysAcls.Add($record)
+                continue
+            }
+
             try {
                 Restore-AuthorizedKeysAcl -Record $record
             } catch {
