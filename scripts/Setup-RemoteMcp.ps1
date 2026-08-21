@@ -939,10 +939,14 @@ function Add-AuthorizedKey {
 
     $terminatorChange = $null
     if ($separator) {
-        $alreadyRecorded = @($Mutation.Changes | Where-Object { $_.Kind -eq "KeyFileTerminator" -and $_.Id -eq $Path }).Count -gt 0
+        # Keyed by path through Scope, not by Id: the Id carries the offset as
+        # well, so a second run on the same file would not match on Id alone.
+        # There can only ever be one -- a second run finds the file terminated
+        # and inserts nothing.
+        $alreadyRecorded = @($Mutation.Changes | Where-Object { $_.Kind -eq "KeyFileTerminator" -and $_.Scope -eq $Path }).Count -gt 0
         if (-not $alreadyRecorded) {
             $terminatorChange = New-ManagedChange -Ledger $Mutation.Changes -Kind KeyFileTerminator `
-                -Id $Path -Scope $Path -Label "the end of $Path" `
+                -Id "$Path|$($existingBytes.Length)" -Scope $Path -Label "the end of $Path" `
                 -Original ([ordered]@{ Terminated = "False" })
         }
     }
@@ -1049,7 +1053,12 @@ function Remove-AuthorizedKey {
 function Remove-AuthorizedKeySeparator {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$Path,
+
+        # Where the terminator went: the length the file had before this
+        # script appended to it.
+        [Parameter(Mandatory = $true)]
+        [int]$Offset
     )
 
     # The terminator an enable run put on this file's previous last line, which
@@ -1070,18 +1079,16 @@ function Remove-AuthorizedKeySeparator {
         return
     }
 
+    # The adapter's Read has already established that the bytes from $Offset
+    # to the end are the terminator this script wrote; truncating there is
+    # what puts the file's ending back where it was.
     $bytes = [System.IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -eq 0 -or $bytes[$bytes.Length - 1] -ne 10) {
+    if ($Offset -lt 0 -or $Offset -ge $bytes.Length) {
         return
     }
 
-    $trim = 1
-    if ($bytes.Length -gt 1 -and $bytes[$bytes.Length - 2] -eq 13) {
-        $trim = 2
-    }
-
-    $shortened = New-Object byte[] ($bytes.Length - $trim)
-    [System.Array]::Copy($bytes, 0, $shortened, 0, $shortened.Length)
+    $shortened = New-Object byte[] $Offset
+    [System.Array]::Copy($bytes, 0, $shortened, 0, $Offset)
 
     Set-FileContentAtomically -Path $Path -Bytes $shortened
     Write-Host "  Restored the end of $Path (the terminator this script added)"
@@ -1770,6 +1777,16 @@ function ConvertTo-PosixSingleQuoted {
 $ChangeAdapters = @{
 
     FirewallRule = @{
+        # All or nothing, for the same reason as the default shell: a rule's
+        # address, profile and enabled flag are one scope, not three settings.
+        # Restoring one dimension while somebody else owns another produces a
+        # combination neither party configured -- an administrator who moves a
+        # narrowed rule to Public would get its address widened back to Any
+        # underneath them, which is broader on Public than the machine ever
+        # was. A rule left narrower than this script found it is the safe
+        # failure here; the run says it is leaving it, and an administrator who
+        # wants it wider can say so.
+        Coupled = $true
         Read = {
             param($Id)
 
@@ -1918,21 +1935,45 @@ $ChangeAdapters = @{
         # second key's newline instead. Ordered after every key on the same
         # path, so by the time it runs there is nothing of this script's left
         # in the file.
+        # Id is "<path>|<offset>": the file, and where in it the terminator
+        # went -- which is the length the file had before this script appended
+        # to it. A position, because "the last byte of the file" stops being
+        # this script's the moment anything else appends a line: trimming then
+        # takes THAT line's terminator and joins it to the original last line,
+        # which is the opposite of preserving what was there.
         Read = {
             param($Id)
 
-            if (-not (Test-Path $Id)) {
+            $path, $offset = "$Id" -split "\|", 2
+            if (-not (Test-Path $path)) {
                 return $null
             }
 
-            $bytes = [System.IO.File]::ReadAllBytes($Id)
-            $terminated = $bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -eq 10
+            $at = [int]$offset
+            $bytes = [System.IO.File]::ReadAllBytes($path)
 
-            [ordered]@{ Terminated = "$terminated" }
+            # Still this script's to remove only where the byte it wrote is
+            # still there AND still ends the file. Anything after it means the
+            # newline now terminates somebody else's line, so it is reported as
+            # changed and left -- one newline more than the file started with,
+            # which sshd does not mind, against corrupting a line this script
+            # did not write.
+            $ours = $at -lt $bytes.Length -and
+                    $bytes[$at] -eq 10 -and
+                    $at -eq $bytes.Length - 1
+            if (-not $ours -and $at -gt 0 -and $at -lt $bytes.Length) {
+                # CRLF: the CR sits at the recorded offset, the LF after it.
+                $ours = $bytes[$at] -eq 13 -and
+                        $at + 1 -eq $bytes.Length - 1 -and
+                        $bytes[$at + 1] -eq 10
+            }
+
+            [ordered]@{ Terminated = "$ours" }
         }
         Write = {
             param($Id, $Field, $Value)
 
+            $path, $offset = "$Id" -split "\|", 2
             if ($Field -ne "Terminated") {
                 throw "Unknown key file field '$Field'."
             }
@@ -1940,7 +1981,7 @@ $ChangeAdapters = @{
                 throw "This script does not add a terminator on the way out."
             }
 
-            Remove-AuthorizedKeySeparator -Path $Id
+            Remove-AuthorizedKeySeparator -Path $path -Offset ([int]$offset)
         }
     }
 
@@ -2299,12 +2340,19 @@ $mutation = [ordered]@{
 $setupFailed = $false
 
 try {
-    Write-Host "[1/4] OpenSSH Server:"
+    Write-Host "[1/5] OpenSSH Server:"
     $mutation.CapabilityInstalled = Install-OpenSshServer
-    Start-SshService -Mutation $mutation
 
+    # Before the service, not after. Installing the capability adds an
+    # exception covering Domain and Private, and any exception already on the
+    # machine covers whatever it covers -- so starting sshd first opens a
+    # window, however short, in which the listener answers from outside
+    # -ClientAddress. Pre-existing keys and password authentication both work
+    # in that window. Nothing in the firewall step needs sshd running, and a
+    # rule this script cannot narrow now fails the run before anything is
+    # listening at all.
     Write-Host ""
-    Write-Host "[2/4] Firewall:"
+    Write-Host "[2/5] Firewall:"
     if ($SkipFirewall) {
         Write-Host "  Skipped (-SkipFirewall specified)."
     } else {
@@ -2316,7 +2364,11 @@ try {
     }
 
     Write-Host ""
-    Write-Host "[3/4] Default shell:"
+    Write-Host "[3/5] sshd service:"
+    Start-SshService -Mutation $mutation
+
+    Write-Host ""
+    Write-Host "[4/5] Default shell:"
     if ($SkipDefaultShell) {
         # Records no change, which is what makes it safe: a value this script
         # never wrote is not one -Disable may delete.
@@ -2326,7 +2378,7 @@ try {
     }
 
     Write-Host ""
-    Write-Host "[4/4] Authorized key:"
+    Write-Host "[5/5] Authorized key:"
     if (-not $resolvedKey) {
         Write-Host "  No key given (-PublicKey / -PublicKeyPath). sshd will read:"
         Write-Host "    $authorizedKeysPath"
