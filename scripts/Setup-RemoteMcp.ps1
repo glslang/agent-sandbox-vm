@@ -294,6 +294,41 @@ $ChangeOrder = [ordered]@{
     FirewallRule      = 60
 }
 
+# Set once, on the enable path only, so the two ledger functions below can put
+# the record on disk as it grows. Left $null everywhere else -- -Disable writes
+# its own reduced record when it finishes, and the unit suites drive the ledger
+# with no state file at all.
+$script:LiveMutation = $null
+$script:PriorState = $null
+
+function Save-ManagedState {
+    # Rule 1 is only worth anything if the record survives the thing that
+    # interrupted the run. Held in memory until a finally, it does not: a
+    # terminated process -- a reset, a taskkill, power loss -- leaves the
+    # machine changed with nothing written down, and the worst case is a key
+    # installed and unrecorded, which is a live credential -Disable will never
+    # find. So the record is rewritten whenever the ledger changes, which is
+    # exactly these two functions.
+    #
+    # Writes are whole-record and atomic (Save-RemoteMcpState swaps a temp file
+    # in), so a kill during one of these costs the update, never the file. The
+    # record can therefore be behind the machine by at most the single call in
+    # flight, and never ahead of it.
+    if (-not $script:LiveMutation) {
+        return
+    }
+
+    try {
+        Save-EnableState -Mutation $script:LiveMutation -State $script:PriorState
+    } catch {
+        # Stopping here is the point. Carrying on would change the machine
+        # past what the record describes, which is the one state -Disable
+        # cannot help with -- so the run fails at the first change it cannot
+        # write down rather than at the end, having made all of them.
+        throw "Could not record this run to $StatePath ($($_.Exception.Message)). Nothing further was changed: a change this script cannot write down is one -Disable cannot put back. Fix that path and rerun -- every step is idempotent, and -Disable puts back whatever this run did manage to record."
+    }
+}
+
 function New-ManagedChange {
     param(
         [Parameter(Mandatory = $true)]
@@ -345,6 +380,7 @@ function New-ManagedChange {
     }
 
     [void]$Ledger.Add($change)
+    Save-ManagedState
     $change
 }
 
@@ -361,6 +397,7 @@ function Set-ChangeApplied {
     )
 
     $Change.Applied[$Field] = $Value
+    Save-ManagedState
 }
 
 function Test-ChangeValueEqual {
@@ -1657,12 +1694,17 @@ function Enable-RemoteMcpFirewall {
     # surface bought for one port.
     $existingRule = Get-NetFirewallRule -Name $SshRuleId -ErrorAction SilentlyContinue
     if ($existingRule) {
-        Set-NetFirewallRule `
-            -Name $SshRuleId `
-            -Direction Inbound `
-            -Action Allow `
-            -Enabled True `
-            -Profile $FirewallProfile
+        # Disabled while its filters are rewritten, and re-enabled only once
+        # the whole scope is in place. A rule's profile, port and address are
+        # set by three separate calls, so leaving it enabled through them
+        # publishes combinations that were never asked for: a rerun moving
+        # from client A on Private to client B on Public would, between the
+        # first call and the last, allow A on Public. Brief, but on a rerun
+        # sshd is already running and answering.
+        #
+        # Off first, on last, so every intermediate state is closed rather
+        # than open.
+        Set-NetFirewallRule -Name $SshRuleId -Enabled False
 
         Get-NetFirewallRule -Name $SshRuleId | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
             -Protocol TCP `
@@ -1670,6 +1712,13 @@ function Enable-RemoteMcpFirewall {
 
         Get-NetFirewallRule -Name $SshRuleId | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter `
             -RemoteAddress $RemoteAddress
+
+        Set-NetFirewallRule `
+            -Name $SshRuleId `
+            -Direction Inbound `
+            -Action Allow `
+            -Enabled True `
+            -Profile $FirewallProfile
 
         Write-Host "  Firewall rule updated: $SshRuleName"
     } else {
@@ -2338,6 +2387,12 @@ $mutation = [ordered]@{
 }
 
 $setupFailed = $false
+
+# From here the ledger writes itself to disk as it grows -- see
+# Save-ManagedState. The finally below still runs, and is what catches the case
+# where nothing was recorded because nothing was changed.
+$script:LiveMutation = $mutation
+$script:PriorState = $existingState
 
 try {
     Write-Host "[1/5] OpenSSH Server:"

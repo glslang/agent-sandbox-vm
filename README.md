@@ -375,8 +375,12 @@ rebuilt; each key installed; and the newline added to a file that had none. One 
 carrying what the machine had (`Original`) and what this script wrote (`Applied`), under one set of
 rules for all of them rather than a separate implementation per component:
 
-1. **Record before mutating.** A change made and not written down is one `-Disable` can never put
-   back.
+1. **Record before mutating, on disk.** A change made and not written down is one `-Disable` can
+   never put back, and a record held in memory does not survive what interrupts a run -- a reset, a
+   kill, power loss. The ledger is rewritten (atomically, whole-file) every time it changes, so the
+   record is behind the machine by at most the single call in flight and never ahead of it. A run
+   that cannot write it stops at the first change it cannot record, rather than making all of them
+   and failing at the end.
 2. **Track what was applied, not what was planned.** `Applied` starts equal to `Original` and
    advances only as each individual write returns, so it describes the machine as the script
    actually left it -- however far through a multi-field change it got. A rerun contributes only
@@ -398,7 +402,10 @@ what puts a key out before that file's terminator, and both before the DACL prot
 order is also the order a run that is *closing* access has to work in: sshd stops and the key comes
 out first, the firewall is handed back last, so `-Disable` never widens the machine while the
 credential it installed is still live. Enable runs the same way round: the firewall boundary is
-enforced *before* sshd is started, so the listener never answers from outside `-ClientAddress`. One consequence worth knowing: a `-Disable` run over the very
+enforced *before* sshd is started, so the listener never answers from outside `-ClientAddress`. On a
+rerun, the script's own rule is disabled while its port, address and profile filters are rewritten,
+and re-enabled only once the whole scope is in place -- that is three calls, and leaving it enabled
+through them would publish combinations nobody asked for. One consequence worth knowing: a `-Disable` run over the very
 ssh access it is closing loses its session part way through, so run it on the guest. Rerunning
 enable never overwrites that record, and a run that fails part way still records what it had already
 changed -- a machine left modified with nothing written down is one `-Disable` cannot help, so a run
