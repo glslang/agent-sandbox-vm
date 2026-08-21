@@ -135,6 +135,11 @@ $StatePath = Join-Path $env:ProgramData "agent-sandbox\remote-mcp-ssh.json"
 $script:UnfinishedRestore = @()
 
 function Get-RemoteMcpState {
+    # $null means there is no record. A record that exists but cannot be parsed
+    # throws instead, because the two must never be confused: read as "no
+    # record", a truncated file would be overwritten by the next enable with
+    # the values this script had already written, and the machine's originals
+    # would be gone for good.
     if (-not (Test-Path $StatePath)) {
         return $null
     }
@@ -142,8 +147,7 @@ function Get-RemoteMcpState {
     try {
         Get-Content -Path $StatePath -Raw | ConvertFrom-Json
     } catch {
-        Write-Warning "Could not read $StatePath ($($_.Exception.Message)); -Disable will only remove this script's own settings."
-        $null
+        throw "$StatePath exists but could not be read ($($_.Exception.Message)). It records what this script changed, so it is not safe to carry on without it: restore or move the file, then rerun."
     }
 }
 
@@ -194,6 +198,14 @@ function Resolve-PublicKey {
     }
 
     $line = $line.Trim()
+
+    # One line, not a pasted block. The pattern below is a prefix match, so a
+    # second key on a second line would ride along unnoticed: both would be
+    # written to the file and recorded as a single multi-line entry, which
+    # -Disable then matches against no line at all and removes neither.
+    if ($line -match "[`\r`\n]") {
+        throw "Give one public key line. -PublicKey contained a line break, which usually means several keys were pasted at once -- add them one run at a time, or point -PublicKeyPath at a file."
+    }
 
     # Catch the two easy mistakes here rather than at first login, where sshd
     # reports only "Permission denied (publickey)": a PRIVATE key pasted by
@@ -385,7 +397,7 @@ function Add-AuthorizedKey {
     )
 
     $existing = if (Test-Path $Path) {
-        @(Get-Content -Path $Path | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        @(Get-Content -Path $Path | ForEach-Object { $_.Trim() })
     } else {
         @()
     }
@@ -395,9 +407,28 @@ function Add-AuthorizedKey {
         return $false
     }
 
-    # ASCII on purpose: sshd does not read a UTF-16 file, which is what
-    # Windows PowerShell's default redirection encoding would produce.
-    Set-Content -Path $Path -Value (@($existing) + $Key) -Encoding Ascii
+    # Appended, never rewritten. The file is not this script's to normalise: it
+    # can hold other keys, comments, blank lines and non-ASCII in a comment
+    # field, and rewriting every line -- which trimming and re-encoding amounts
+    # to -- would destroy content nothing here records for -Disable to restore.
+    #
+    # UTF-8 without a BOM, written through .NET rather than Set-Content:
+    # Windows PowerShell's -Encoding UTF8 emits a BOM, which on a new file
+    # would sit in front of the first key and stop sshd reading it, and its
+    # default redirection encoding is UTF-16, which sshd cannot read at all.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    # A file whose last line has no newline would otherwise get this key glued
+    # onto the end of it. Checked as bytes, so no encoding guess is involved.
+    $separator = ""
+    if (Test-Path $Path) {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -ne 10) {
+            $separator = [Environment]::NewLine
+        }
+    }
+
+    [System.IO.File]::AppendAllText($Path, $separator + $Key + [Environment]::NewLine, $utf8NoBom)
     Write-Host "  Key added to $Path"
     $true
 }
@@ -416,8 +447,15 @@ function Remove-AuthorizedKey {
         return
     }
 
-    $remaining = @(Get-Content -Path $Path | Where-Object { $_.Trim() -ne $Key })
-    Set-Content -Path $Path -Value $remaining -Encoding Ascii
+    # Taking a line out means rewriting the file, so this keeps everything else
+    # exactly as it was -- other keys, comments, blank lines, and any non-ASCII
+    # in a comment field -- rather than passing it through Get-Content and
+    # Set-Content, which would trim and re-encode all of it.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $text = [System.IO.File]::ReadAllText($Path, $utf8NoBom)
+    $kept = @(($text -split "`\r?`\n") | Where-Object { $_.Trim() -ne $Key })
+
+    [System.IO.File]::WriteAllText($Path, ($kept -join [Environment]::NewLine), $utf8NoBom)
     Write-Host "  Key removed from $Path"
 }
 
@@ -852,14 +890,21 @@ function Enable-RemoteMcpFirewall {
 function Save-EnableState {
     param(
         [Parameter(Mandatory = $true)]
-        [object]$Mutation
+        [object]$Mutation,
+
+        # The record as it stood before this run. Passed in rather than read
+        # here, because this runs in a finally: a read that threw there would
+        # replace whatever exception brought us to it.
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$State
     )
 
     # Only the first run to touch a component sees the machine's original
     # setting for it. A rerun must not overwrite that with a value this script
     # already wrote, or -Disable would restore this script's configuration
     # instead of the machine's.
-    $state = Get-RemoteMcpState
+    $state = $State
 
     if (-not $state) {
         Save-RemoteMcpState -State ([ordered]@{
@@ -1051,7 +1096,17 @@ if ($Disable) {
         exit 0
     }
 
-    $state = Get-RemoteMcpState
+    # Unreadable is not the same as absent here either: this run cannot restore
+    # what it cannot read, so it removes only its own rule and keeps the file
+    # for a later attempt rather than reporting there was nothing to put back.
+    $stateUnreadable = $false
+    $state = $null
+    try {
+        $state = Get-RemoteMcpState
+    } catch {
+        $stateUnreadable = $true
+        Write-Warning $_.Exception.Message
+    }
 
     Write-Host "Closing remote MCP access:"
 
@@ -1119,7 +1174,10 @@ if ($Disable) {
 
     Restore-SshService -State $state
 
-    if ($state) {
+    if ($stateUnreadable) {
+        Write-Host ""
+        Write-Warning "Kept $StatePath -- it could not be read, so nothing recorded in it was put back. Only this script's own firewall rule was removed."
+    } elseif ($state) {
         # The record is the only way back for anything still changed, and a
         # failure here is usually transient -- a group-policy rule, a service
         # mid-transition. Keep it so a later -Disable can pick up where this
@@ -1140,6 +1198,11 @@ if ($Disable) {
 if ($FirewallProfile -contains "Any" -and $FirewallProfile.Count -gt 1) {
     throw "Use -FirewallProfile Any by itself, or choose one or more of Domain, Private, Public."
 }
+
+# Read before anything is changed. Get-RemoteMcpState throws on a record it
+# cannot parse, and this is where that has to happen: from inside the run it
+# would abort with the machine already half configured.
+$existingState = Get-RemoteMcpState
 
 $resolvedKey = Resolve-PublicKey -Key $PublicKey -Path $PublicKeyPath
 
@@ -1268,7 +1331,7 @@ try {
 } finally {
     # Never let a failure here replace the exception that got us here.
     try {
-        Save-EnableState -Mutation $mutation
+        Save-EnableState -Mutation $mutation -State $existingState
     } catch {
         Write-Warning "Could not record what this run changed to $StatePath ($($_.Exception.Message)); -Disable will not be able to put it back."
     }
