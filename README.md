@@ -277,7 +277,11 @@ scripted rather than described:
   `Connection refused` at once. The script adds its own rule on `-FirewallProfile` (default `Any`)
   scoped to `-ClientAddress`, and narrows every other inbound rule on that port to the same
   allowlist -- firewall allow rules are additive, so a narrow rule cannot claw back a wider one.
-  Reclassifying the network to `Private` instead would work in one line, at the cost of activating
+  A rule counts as being on that port whether its filter names the port exactly or a range spanning
+  it. One whose filter is `LocalPort Any` is *reported* rather than rescoped: such a rule is usually
+  scoped to a program rather than to a port, making it an app's inbound rule rather than an ssh
+  hole, and narrowing every one of them to the ssh client would take the VM's other inbound traffic
+  down with it. Reclassifying the network to `Private` instead would work in one line, at the cost of activating
   every other `Private` inbound rule: file and printer sharing, network discovery.
 - **The default shell.** OpenSSH runs an exec request through it. `cmd /c` hands the child the
   inherited pipe handles and stays out of the way; PowerShell captures the output through its own
@@ -288,11 +292,15 @@ scripted rather than described:
 - **Which authorized-keys file.** For a member of the Administrators group -- which the VM user is if
   you are kernel debugging -- sshd ignores `~/.ssh/authorized_keys` and reads
   `C:\ProgramData\ssh\administrators_authorized_keys`. A key in the other file is not an error
-  anywhere; it is just a login that never authenticates.
+  anywhere; it is just a login that never authenticates. Membership is resolved through nested
+  groups, since sshd reads it off the logon token; where it cannot be resolved at all -- a domain
+  group among the members -- the run says so, and the summary always names the file it chose.
 - **Its ACL.** sshd refuses an authorized-keys file any other principal can write, and logs the
-  refusal nowhere you would think to look. The script strips inheritance and grants only
+  refusal nowhere you would think to look. The script rebuilds the file's DACL to grant only
   Administrators and SYSTEM, by well-known SID rather than by group name so it works on a
-  non-English Windows too.
+  non-English Windows too. Rebuilt rather than amended: `icacls /inheritance:r /grant` reads like it
+  tightens a file, but `/inheritance:r` drops only *inherited* entries and `/grant` only adds or
+  updates the trustees it names, so an explicit entry for anyone else would survive both.
 
 Environment matters differently over ssh: the session inherits machine and user variables from the
 registry but **nothing** from a PowerShell `$PROFILE`, so a server configured by environment variable
