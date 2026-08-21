@@ -376,7 +376,9 @@ rules for all of them rather than a separate implementation per component:
    back.
 2. **Track what was applied, not what was planned.** `Applied` starts equal to `Original` and
    advances only as each individual write returns, so it describes the machine as the script
-   actually left it -- however far through a multi-field change it got.
+   actually left it -- however far through a multi-field change it got. A rerun contributes only
+   the fields it actually wrote: one it merely looked at keeps whatever the earlier run recorded,
+   so a value somebody else set in between is never mistaken for this script's own.
 3. **Verify before reverting.** A field goes back only where the machine still holds the value this
    script wrote; anything else belongs to whoever changed it since.
 4. **Drop what is restored, keep what is not.** What stays on record is exactly the work still
