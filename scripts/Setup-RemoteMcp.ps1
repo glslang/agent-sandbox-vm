@@ -121,6 +121,17 @@ $ErrorActionPreference = "Stop"
 $SshRuleId = "AgentSandbox-RemoteMcp-SSH"
 $SshRuleName = "Agent Sandbox Remote MCP SSH"
 $OpenSshKeyPath = "HKLM:\SOFTWARE\OpenSSH"
+
+# Stamped into the record. There is no version 1 in the wild -- this script has
+# not shipped -- so nothing reads an older shape; the field is here so that a
+# later change to it has somewhere to branch on.
+$StateVersion = 2
+
+# The key types sshd accepts on an authorized_keys line. One list, used both to
+# validate what is handed in and to find the type within a line that may open
+# with options -- two copies would drift, and a type missing from the second
+# copy is a key -Disable cannot find.
+$KeyTypePattern = "(?:ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
 $DefaultShellValueName = "DefaultShell"
 $DefaultShellCommandOptionValueName = "DefaultShellCommandOption"
 $CmdCommandOption = "/c"
@@ -212,6 +223,297 @@ function Save-RemoteMcpState {
     Set-FileContentAtomically -Path $StatePath -Bytes $utf8NoBom.GetBytes($json)
 }
 
+
+# ---------------------------------------------------------------------------
+# The change ledger
+# ---------------------------------------------------------------------------
+#
+# Every change this script makes to the machine is one entry here, and the same
+# four rules apply to all of them. They were previously written out once per
+# component -- the default shell, the sshd service, each competing firewall
+# rule, each authorized-keys file and its DACL -- each with its own record
+# shape and its own comparison code. That is what fifteen rounds of review
+# found: not one broken rule, but the same rule missing from whichever
+# component nobody had written it into yet. Adding a component meant
+# reimplementing all four, and forgetting one was silent.
+#
+#   1. Record before mutating. A change made and not written down is one
+#      -Disable can never put back.
+#   2. Track what was applied, not what was planned. Applied starts equal to
+#      Original and advances only as each individual write returns, so it
+#      always describes the machine as this script actually left it -- however
+#      far through a multi-field change it got.
+#   3. Verify before reverting. Restore a field only where the machine still
+#      holds the value this script wrote. Anything else belongs to whoever
+#      changed it since; putting an original back over their value would undo
+#      a deliberate decision, and for the firewall and the service that means
+#      handing out access at the moment this script is taking its own away.
+#   4. Drop what is restored, keep what is not. The record left behind is
+#      exactly the work still outstanding, so a later -Disable resumes rather
+#      than re-applying.
+#
+# A change is a value per field rather than a single value, because rules 2
+# and 3 are per field: narrowing a firewall rule is an address write and a
+# profile write, either of which can fail on its own.
+#
+#   Kind      selects the adapter that reads and writes this sort of thing
+#   Id        which one (a rule name, a file path, a fixed name for singletons)
+#   Scope     what it belongs to, for ordering; a file path, or $null
+#   Original  the machine's own values, restored by -Disable
+#   Applied   what this script last successfully wrote
+#
+# Restore order is by Kind, and within a Scope the lower Order goes first.
+# That one rule produces the two orderings that were previously special cases:
+# a key comes out before the file's terminator, and both before the DACL that
+# protects them -- because removing a key needs the write access the DACL
+# restore gives away.
+
+$ChangeOrder = [ordered]@{
+    FirewallRule      = 10
+    DefaultShell      = 20
+    AuthorizedKey     = 30
+    KeyFileTerminator = 40
+    AuthorizedKeysAcl = 50
+    SshService        = 60
+}
+
+function New-ManagedChange {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.ArrayList]$Ledger,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Kind,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Id,
+
+        # IDictionary, not hashtable: a [hashtable] parameter CONVERTS an
+        # ordered dictionary passed to it into an unordered one, and the field
+        # order is the order the fields are restored in. Typing this loosely
+        # made restore order depend on hash bucketing.
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Original,
+
+        [AllowNull()]
+        [string]$Scope = $null,
+
+        # What the change will be called in the run's output. The adapters
+        # deal in field names; a person reading a -Disable wants the rule's
+        # display name or the file's path.
+        [AllowNull()]
+        [string]$Label = $null
+    )
+
+    # Applied starts at Original: nothing has been written yet, so as far as
+    # this record is concerned the machine still holds its own values. Each
+    # write that returns advances one field. Registering first and advancing
+    # after is what keeps rule 1 and rule 2 from pulling against each other --
+    # the entry exists before anything changes, and never claims more than
+    # actually happened.
+    $change = [pscustomobject]@{
+        Kind     = $Kind
+        Id       = $Id
+        Scope    = $Scope
+        Label    = $(if ($Label) { $Label } else { $Id })
+        Original = [ordered]@{}
+        Applied  = [ordered]@{}
+    }
+
+    foreach ($field in $Original.Keys) {
+        $change.Original[$field] = $Original[$field]
+        $change.Applied[$field] = $Original[$field]
+    }
+
+    [void]$Ledger.Add($change)
+    $change
+}
+
+function Set-ChangeApplied {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Change,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Field,
+
+        [AllowNull()]
+        [object]$Value
+    )
+
+    $Change.Applied[$Field] = $Value
+}
+
+function Test-ChangeValueEqual {
+    param([AllowNull()][object]$Left, [AllowNull()][object]$Right)
+
+    # Compared as the adapters produce them: a scalar or a list of strings.
+    # Order does not matter for a firewall rule's addresses or profiles, and
+    # a scalar is compared as text so "True" from a CIM property and $true
+    # from a record that has been through JSON are the same answer.
+    $l = @($Left  | Where-Object { $null -ne $_ })
+    $r = @($Right | Where-Object { $null -ne $_ })
+
+    if ($l.Count -ne $r.Count) {
+        return $false
+    }
+    if ($l.Count -eq 0) {
+        return $true
+    }
+    if ($l.Count -eq 1) {
+        return "$($l[0])" -eq "$($r[0])"
+    }
+
+    @(Compare-Object -ReferenceObject @($l | ForEach-Object { "$_" }) `
+                     -DifferenceObject @($r | ForEach-Object { "$_" })).Count -eq 0
+}
+
+function Get-ChangeAdapter {
+    param([Parameter(Mandatory = $true)][string]$Kind)
+
+    if (-not $ChangeAdapters.Contains($Kind)) {
+        throw "No adapter for change kind '$Kind'. This is a bug in this script: a change was recorded that nothing knows how to read back or restore."
+    }
+
+    $ChangeAdapters[$Kind]
+}
+
+function Get-ChangeDrift {
+    param([Parameter(Mandatory = $true)][object]$Change)
+
+    # Which fields the machine no longer holds as this script left them. An
+    # empty list means the change is still this script's to undo; anything in
+    # it belongs to whoever wrote it.
+    #
+    # A record from a run that predates a field cannot be checked against it,
+    # so a field missing from Applied is not drift.
+    $adapter = Get-ChangeAdapter -Kind $Change.Kind
+    $live = & $adapter.Read $Change.Id
+
+    if ($null -eq $live) {
+        # The thing itself is gone -- a deleted rule, a removed file. There is
+        # nothing to put back and recreating it is not this script's business.
+        return @("(gone)")
+    }
+
+    $drift = @()
+    foreach ($field in @($Change.Applied.Keys)) {
+        if (-not $live.Contains($field)) {
+            continue
+        }
+        if (-not (Test-ChangeValueEqual -Left $live[$field] -Right $Change.Applied[$field])) {
+            $drift += $field
+        }
+    }
+
+    $drift
+}
+
+function Restore-ManagedChange {
+    param([Parameter(Mandatory = $true)][object]$Change)
+
+    # Field by field, advancing Applied as each write returns. A write that
+    # throws leaves the entry describing exactly how far this got, so the
+    # -Disable that retries compares against that rather than against work it
+    # has already done -- which is rule 2 doing the job it exists for on the
+    # way back out as well as the way in.
+    $adapter = Get-ChangeAdapter -Kind $Change.Kind
+
+    foreach ($field in @($Change.Original.Keys)) {
+        if (Test-ChangeValueEqual -Left $Change.Applied[$field] -Right $Change.Original[$field]) {
+            continue
+        }
+
+        & $adapter.Write $Change.Id $field $Change.Original[$field]
+        Set-ChangeApplied -Change $Change -Field $field -Value $Change.Original[$field]
+    }
+}
+
+function Merge-ChangeLedger {
+    param(
+        [AllowNull()][object]$Stored,
+        [AllowNull()][object]$Applied
+    )
+
+    # One rule for every kind of change, which is the whole point of the
+    # ledger: the ORIGINAL belongs to the first run that touched a thing --
+    # that is the machine's own value, and the only one worth protecting --
+    # while APPLIED belongs to the latest run, because that is what the thing
+    # looks like now. Getting this wrong in either direction was found four
+    # separate times while each component kept its own copy of it: a rerun
+    # that overwrote an original restored this script's configuration instead
+    # of the machine's, and one that kept a stale applied value made -Disable
+    # read its own second pass as somebody else's edit.
+    $merged = @()
+    $seen = @{}
+
+    foreach ($entry in @(@($Stored) | Where-Object { $_ })) {
+        $key = "$($entry.Kind)|$($entry.Id)"
+        $latest = @(@($Applied) | Where-Object { $_ -and "$($_.Kind)|$($_.Id)" -eq $key }) |
+            Select-Object -First 1
+
+        if ($latest) {
+            $entry.Applied = $latest.Applied
+        }
+
+        $merged += $entry
+        $seen[$key] = $true
+    }
+
+    foreach ($entry in @(@($Applied) | Where-Object { $_ })) {
+        if (-not $seen.ContainsKey("$($entry.Kind)|$($entry.Id)")) {
+            $merged += $entry
+        }
+    }
+
+    $merged
+}
+
+function ConvertTo-ChangeLedger {
+    param([AllowNull()][object]$Entries)
+
+    # JSON gives back PSCustomObjects where the ledger wants indexable field
+    # maps. Rehydrated once on the way in rather than guarded at every use.
+    $ledger = New-Object System.Collections.ArrayList
+
+    foreach ($entry in @(@($Entries) | Where-Object { $_ })) {
+        $original = [ordered]@{}
+        $applied = [ordered]@{}
+
+        foreach ($field in @($entry.Original.PSObject.Properties)) {
+            $original[$field.Name] = $field.Value
+        }
+        foreach ($field in @($entry.Applied.PSObject.Properties)) {
+            $applied[$field.Name] = $field.Value
+        }
+
+        [void]$ledger.Add([pscustomobject]@{
+            Kind     = "$($entry.Kind)"
+            Id       = "$($entry.Id)"
+            Scope    = $(if ($entry.Scope) { "$($entry.Scope)" } else { $null })
+            Label    = $(if ($entry.Label) { "$($entry.Label)" } else { "$($entry.Id)" })
+            Original = $original
+            Applied  = $applied
+        })
+    }
+
+    $ledger
+}
+
+function Get-OrderedChanges {
+    param(
+        [AllowNull()][object]$Ledger
+    )
+
+    # Restore order. Unknown kinds sort last rather than throwing here; the
+    # adapter lookup is where that is reported, with the entry in hand.
+    @(@($Ledger) | Where-Object { $_ } | Sort-Object `
+        @{ Expression = { $(if ($ChangeOrder.Contains("$($_.Kind)")) { $ChangeOrder["$($_.Kind)"] } else { 999 }) } }, `
+        @{ Expression = { "$($_.Id)" } })
+}
+
 function Resolve-PublicKey {
     param(
         [AllowEmptyString()]
@@ -261,7 +563,7 @@ function Resolve-PublicKey {
         throw "That is a private key. Install the public half instead -- the .pub file, one line beginning with ssh-ed25519 or ssh-rsa."
     }
 
-    if ($line -notmatch "^(ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\s+\S+") {
+    if ($line -notmatch "^$KeyTypePattern\s+\S+") {
         throw "Does not look like an OpenSSH public key line: $line"
     }
 
@@ -406,11 +708,11 @@ function Set-AuthorizedKeysAcl {
     # Keyed by path: a rerun for a different -User or -AuthorizedKeysFile
     # rebuilds a second file's DACL, and a single slot would keep the first
     # record and drop the second, leaving -Disable unable to put that one back.
-    $alreadyRecorded = @($Mutation.AuthorizedKeysAcls | Where-Object { $_.Path -eq $Path }).Count -gt 0
+    $alreadyRecorded = @($Mutation.Changes | Where-Object { $_.Kind -eq "AuthorizedKeysAcl" -and $_.Id -eq $Path }).Count -gt 0
+    $change = $null
 
     if ($FileExisted -and -not $alreadyRecorded) {
-        [void]$Mutation.AuthorizedKeysAcls.Add([pscustomobject]@{
-            Path = $Path
+        $change = New-ManagedChange -Ledger $Mutation.Changes -Kind AuthorizedKeysAcl -Id $Path -Scope $Path -Label "the ACL on $Path" -Original ([ordered]@{
             Sddl = $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
         })
     }
@@ -432,6 +734,12 @@ function Set-AuthorizedKeysAcl {
     }
 
     Set-Acl -Path $Path -AclObject $acl
+
+    # After the write, so the entry never claims a DACL that was not replaced.
+    if ($change) {
+        Set-ChangeApplied -Change $change -Field Sddl -Value $acl.GetSecurityDescriptorSddlForm(
+            [System.Security.AccessControl.AccessControlSections]::Access)
+    }
 }
 
 function Get-AuthorizedKeyIdentity {
@@ -445,12 +753,38 @@ function Get-AuthorizedKeyIdentity {
     # line is a comment it does not read, so two lines differing only there are
     # the same credential -- and comparing whole lines would let an edited
     # comment hide a key this script installed from its own removal.
+    #
+    # The type is not necessarily the first field. An authorized_keys line may
+    # open with options -- `restrict`, `from="10.0.0.1"`, `command="..."` --
+    # which sshd applies to a key it still accepts. So the type is found rather
+    # than assumed: an operator hardening this script's own entry with `restrict`
+    # must not make it unrecognisable to -Disable, which would report a live
+    # credential removed.
     $fields = @("$Line".Trim() -split "\s+" | Where-Object { $_ })
-    if ($fields.Count -lt 2) {
-        return $null
+
+    for ($i = 0; $i -lt $fields.Count - 1; $i++) {
+        # Both halves have to look right. An option value can hold anything in
+        # quotes, `command="ssh-rsa AAAA"` included, so a field spelled like a
+        # key type is only taken as one when what follows it is base64 and
+        # nothing else -- the quote still attached to the end of a decoy's blob
+        # is what rules it out. No length floor: this must accept exactly what
+        # Resolve-PublicKey accepts, and two validators of the same thing that
+        # disagree are the bug this ledger exists to stop making.
+        #
+        # A bare `ssh-rsa <base64>` inside a quoted option value would still
+        # match. That is an operator's own option text, and the cost is a
+        # wrongly computed identity for a line this script did not write.
+        if ($fields[$i] -notmatch "^$KeyTypePattern$") {
+            continue
+        }
+        if ($fields[$i + 1] -notmatch "^[A-Za-z0-9+/]+={0,2}$") {
+            continue
+        }
+
+        return "$($fields[$i]) $($fields[$i + 1])"
     }
 
-    "$($fields[0]) $($fields[1])"
+    $null
 }
 
 function Add-AuthorizedKey {
@@ -459,7 +793,10 @@ function Add-AuthorizedKey {
         [string]$Path,
 
         [Parameter(Mandatory = $true)]
-        [string]$Key
+        [string]$Key,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Mutation
     )
 
     # A byte-order mark means this file is not what sshd reads. Windows
@@ -495,10 +832,14 @@ function Add-AuthorizedKey {
     }
 
     $identity = Get-AuthorizedKeyIdentity -Line $Key
+    if (-not $identity) {
+        throw "Does not look like an OpenSSH public key line: $Key"
+    }
+
     foreach ($line in $existing) {
         if ((Get-AuthorizedKeyIdentity -Line $line) -eq $identity) {
             Write-Host "  Key already present in $Path"
-            return [pscustomobject]@{ Added = $false; AddedSeparator = $false }
+            return
         }
     }
 
@@ -530,6 +871,24 @@ function Add-AuthorizedKey {
         $separator = [Environment]::NewLine
     }
 
+    # Recorded before the write, so a key sshd would accept can never exist
+    # without an entry saying so. Two entries where a terminator has to go in:
+    # the key, and the file's ending. They are separate because they come back
+    # out at different times -- see the KeyFileTerminator adapter.
+    $keyChange = New-ManagedChange -Ledger $Mutation.Changes -Kind AuthorizedKey `
+        -Id "$Path|$identity" -Scope $Path -Label "the key in $Path" `
+        -Original ([ordered]@{ Present = "False" })
+
+    $terminatorChange = $null
+    if ($separator) {
+        $alreadyRecorded = @($Mutation.Changes | Where-Object { $_.Kind -eq "KeyFileTerminator" -and $_.Id -eq $Path }).Count -gt 0
+        if (-not $alreadyRecorded) {
+            $terminatorChange = New-ManagedChange -Ledger $Mutation.Changes -Kind KeyFileTerminator `
+                -Id $Path -Scope $Path -Label "the end of $Path" `
+                -Original ([ordered]@{ Terminated = "False" })
+        }
+    }
+
     # Swapped in rather than appended in place. An append that failed part way
     # could leave a complete, working key line in the file while throwing --
     # and a key sshd accepts that this run never got to record is one -Disable
@@ -543,8 +902,10 @@ function Add-AuthorizedKey {
     Set-FileContentAtomically -Path $Path -Bytes $combined
     Write-Host "  Key added to $Path"
 
-    # Whether a terminator had to be inserted, so -Disable can take it back out.
-    [pscustomobject]@{ Added = $true; AddedSeparator = [bool]$separator }
+    Set-ChangeApplied -Change $keyChange -Field Present -Value "True"
+    if ($terminatorChange) {
+        Set-ChangeApplied -Change $terminatorChange -Field Terminated -Value "True"
+    }
 }
 
 function Remove-AuthorizedKey {
@@ -552,13 +913,10 @@ function Remove-AuthorizedKey {
         [Parameter(Mandatory = $true)]
         [string]$Path,
 
+        # Type plus base64 blob -- what sshd authenticates on, and what the
+        # ledger keys this change by.
         [Parameter(Mandatory = $true)]
-        [string]$Key,
-
-        # True when adding this key had to terminate the file's previous last
-        # line, which had none. That newline is this run's too, so it comes
-        # back out with the key.
-        [bool]$AddedSeparator = $false
+        [string]$Identity
     )
 
     if (-not (Test-Path $Path)) {
@@ -576,7 +934,14 @@ function Remove-AuthorizedKey {
     $bytes = [System.IO.File]::ReadAllBytes($Path)
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $kept = New-Object System.IO.MemoryStream
-    $identity = Get-AuthorizedKeyIdentity -Line $Key
+    if (-not $Identity) {
+        # Nothing here identifies a key. Matching on a null identity would take
+        # out every line that is not a key either -- the comments and blank
+        # lines this file is explicitly not allowed to lose.
+        throw "No key identity to remove from $Path."
+    }
+
+    $identity = $Identity
     $removed = $false
     $start = 0
 
@@ -609,23 +974,11 @@ function Remove-AuthorizedKey {
     $kept.Dispose()
 
     if (-not $removed) {
-        Write-Host "  Key not found in $Path; nothing to remove."
+        # Not a failure: the ledger has already established that this key is
+        # this script's to remove, so finding it gone means somebody got there
+        # first. Nothing to write.
+        Write-Host "  Key already gone from $Path"
         return
-    }
-
-    # The terminator this run put on the file's previous last line goes back
-    # out with the key, so the file ends where it did before. If something else
-    # has been appended since, the byte removed is that line's terminator
-    # instead -- one trailing newline either way, which sshd does not require.
-    if ($AddedSeparator -and $result.Length -gt 0 -and $result[$result.Length - 1] -eq 10) {
-        $trim = 1
-        if ($result.Length -gt 1 -and $result[$result.Length - 2] -eq 13) {
-            $trim = 2
-        }
-
-        $shortened = New-Object byte[] ($result.Length - $trim)
-        [System.Array]::Copy($result, 0, $shortened, 0, $shortened.Length)
-        $result = $shortened
     }
 
     # Swapped in rather than written over: unrelated keys and comments in this
@@ -633,6 +986,47 @@ function Remove-AuthorizedKey {
     # with nothing able to put them back.
     Set-FileContentAtomically -Path $Path -Bytes $result
     Write-Host "  Key removed from $Path"
+}
+
+function Remove-AuthorizedKeySeparator {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    # The terminator an enable run put on this file's previous last line, which
+    # had none. It goes back out so the file ends where it did before.
+    #
+    # A step of its own, run once the file holds no managed key at all, rather
+    # than folded into removing the key that recorded it. Two enable runs can
+    # append two keys, and only the first records a separator -- so trimming as
+    # that first key came out would take the *second* key's terminator with it
+    # and leave the separator sitting in the middle of the file. What is at the
+    # end of the file is only this run's byte once everything this script put
+    # there is gone.
+    #
+    # If something else has been appended since, the byte removed is that
+    # line's terminator instead -- one trailing newline either way, which sshd
+    # does not require.
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0 -or $bytes[$bytes.Length - 1] -ne 10) {
+        return
+    }
+
+    $trim = 1
+    if ($bytes.Length -gt 1 -and $bytes[$bytes.Length - 2] -eq 13) {
+        $trim = 2
+    }
+
+    $shortened = New-Object byte[] ($bytes.Length - $trim)
+    [System.Array]::Copy($bytes, 0, $shortened, 0, $shortened.Length)
+
+    Set-FileContentAtomically -Path $Path -Bytes $shortened
+    Write-Host "  Restored the end of $Path (the terminator this script added)"
 }
 
 function Install-OpenSshServer {
@@ -676,12 +1070,25 @@ function Start-SshService {
     # startup type already changed, and a return value never reaches the caller
     # from a function that threw.
     $priorStartType = "$($service.StartType)"
-    $Mutation.SshStartType = $priorStartType
-    $Mutation.SshWasRunning = ($service.Status -eq "Running")
+    $wasRunning = ($service.Status -eq "Running")
+
+    # Where this run installed the capability, the machine's "own" startup type
+    # is the one a fresh install leaves, not the Disabled a missing service
+    # reports -- the capability is never removed, because uninstalling it
+    # discards the host keys and changes the fingerprint every client has
+    # already accepted.
+    $originalStartType = if ($Mutation.CapabilityInstalled) { "Manual" } else { $priorStartType }
+    $originalRunning = if ($Mutation.CapabilityInstalled) { "False" } else { "$wasRunning" }
+
+    $change = New-ManagedChange -Ledger $Mutation.Changes -Kind SshService -Id sshd -Label "the sshd service" -Original ([ordered]@{
+        StartType = $originalStartType
+        Running   = $originalRunning
+    })
 
     Set-Service -Name sshd -StartupType Automatic
+    Set-ChangeApplied -Change $change -Field StartType -Value "Automatic"
 
-    if (-not $Mutation.SshWasRunning) {
+    if (-not $wasRunning) {
         # The first start is also what generates the host keys and creates
         # C:\ProgramData\ssh, which the authorized-keys step below needs.
         Start-Service -Name sshd
@@ -689,6 +1096,8 @@ function Start-SshService {
     } else {
         Write-Host "  sshd already running; startup type Automatic (was $priorStartType)."
     }
+
+    Set-ChangeApplied -Change $change -Field Running -Value "True"
 }
 
 function Get-OpenSshValue {
@@ -752,14 +1161,16 @@ function Set-SshDefaultShell {
     # Recorded before the write, for the same reason as the service above. A
     # null prior records "the value did not exist", which -Disable restores by
     # deleting it again -- sshd falls back to cmd.exe on its own.
-    $Mutation.DefaultShell = $prior
-    $Mutation.DefaultShellCommandOption = $priorOption
-    $Mutation.DefaultShellManaged = $true
+    $change = New-ManagedChange -Ledger $Mutation.Changes -Kind DefaultShell -Id shell -Label "the default shell" -Original ([ordered]@{
+        Shell         = $prior
+        CommandOption = $priorOption
+    })
 
     if ($prior -and $prior -ieq $CmdPath) {
         Write-Host "  Already $CmdPath"
     } else {
         Set-OpenSshValue -Name $DefaultShellValueName -Value $CmdPath
+        Set-ChangeApplied -Change $change -Field Shell -Value $CmdPath
 
         if ($prior) {
             Write-Host "  Set to $CmdPath (was $prior)."
@@ -776,66 +1187,8 @@ function Set-SshDefaultShell {
     # a value that is there and wrong gets corrected.
     if ($priorOption -and $priorOption -ne $CmdCommandOption) {
         Set-OpenSshValue -Name $DefaultShellCommandOptionValueName -Value $CmdCommandOption
+        Set-ChangeApplied -Change $change -Field CommandOption -Value $CmdCommandOption
         Write-Host "  Command option set to $CmdCommandOption (was $priorOption)."
-    }
-}
-
-function Restore-SshDefaultShell {
-    param(
-        [Parameter(Mandatory = $true)]
-        [AllowNull()]
-        [object]$Value,
-
-        [Parameter(Mandatory = $true)]
-        [AllowNull()]
-        [object]$CommandOption
-    )
-
-    if (-not (Test-Path $OpenSshKeyPath)) {
-        Write-Host "  No OpenSSH registry key; default shell left alone."
-        return
-    }
-
-    # Only if what is there now is what this script wrote. A record can outlive
-    # the change it describes -- a partial -Disable whose reduced record could
-    # not be saved leaves the full one on disk -- and putting a pre-enable value
-    # over a shell somebody set in the meantime is the one outcome worse than
-    # leaving it alone.
-    # Both values, and a missing one counts: an administrator who deleted
-    # DefaultShell has removed exactly what this script wrote, so reinstating
-    # the pre-enable value over that is no better than overwriting a new one.
-    $currentShell = Get-OpenSshValue -Name $DefaultShellValueName
-    $currentOption = Get-OpenSshValue -Name $DefaultShellCommandOptionValueName
-
-    # What this run left behind: cmd.exe, and /c only where there had been an
-    # option value that was not already /c. Where there was none, none was
-    # written, and the recorded value is what should still be there.
-    $expectedOption = if ($CommandOption -and -not ("$CommandOption" -ieq $CmdCommandOption)) {
-        $CmdCommandOption
-    } else {
-        $CommandOption
-    }
-
-    if (-not ($currentShell -and ("$currentShell" -ieq $CmdPath))) {
-        $now = if ($currentShell) { $currentShell } else { "not set" }
-        Write-Host "  Default shell is now $now, which this script did not leave there; left alone."
-        return
-    }
-
-    if (-not ("$currentOption" -ieq "$expectedOption")) {
-        $now = if ($currentOption) { $currentOption } else { "not set" }
-        Write-Host "  Default shell command option is now $now, which this script did not leave there; shell and option left alone."
-        return
-    }
-
-    # Both halves, since setting a shell can have changed both.
-    Set-OpenSshValue -Name $DefaultShellValueName -Value $Value
-    Set-OpenSshValue -Name $DefaultShellCommandOptionValueName -Value $CommandOption
-
-    if ($null -eq $Value -or "$Value" -eq "") {
-        Write-Host "  Default shell value removed; sshd falls back to cmd.exe."
-    } else {
-        Write-Host "  Default shell restored to its previous value ($Value)."
     }
 }
 
@@ -1058,7 +1411,7 @@ function Enable-RemoteMcpFirewall {
         # an empty one -- which is exactly what the first run passes.
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
-        [System.Collections.ArrayList]$AdjustedRule
+        [System.Collections.ArrayList]$Ledger
     )
 
     # 22 stays in scope even when -Port names another one, because the
@@ -1184,25 +1537,26 @@ function Enable-RemoteMcpFirewall {
         # since changed -- putting a broad, enabled original back over a rule
         # somebody deliberately tightened would hand out access at the very
         # moment this script is taking its own away.
-        [void]$AdjustedRule.Add([pscustomobject]@{
-            Name                 = $rule.Name
-            RemoteAddress        = $priorAddress
-            Profile              = $priorProfile
-            Enabled              = $priorEnabled
-            AppliedRemoteAddress = $(if ($narrowedAddress) { @($narrowedAddress) } else { $priorAddress })
-            AppliedProfile       = $(if ($narrowedProfile) { @($narrowedProfile) } else { $priorProfile })
-            AppliedEnabled       = $(if ($disableRule) { "False" } else { $priorEnabled })
-        })
+        $record = New-ManagedChange -Ledger $Ledger -Kind FirewallRule -Id $rule.Name `
+            -Label "firewall rule $($rule.DisplayName) ($($rule.Name))" `
+            -Original ([ordered]@{
+                RemoteAddress = $priorAddress
+                Profile       = $priorProfile
+                Enabled       = $priorEnabled
+            })
 
         try {
             if ($narrowedAddress) {
                 Set-NetFirewallRule -Name $rule.Name -RemoteAddress $narrowedAddress
+                Set-ChangeApplied -Change $record -Field RemoteAddress -Value @($narrowedAddress)
             }
 
             if ($disableRule) {
                 Set-NetFirewallRule -Name $rule.Name -Enabled False
+                Set-ChangeApplied -Change $record -Field Enabled -Value "False"
             } elseif ($narrowedProfile) {
                 Set-NetFirewallRule -Name $rule.Name -Profile $narrowedProfile
+                Set-ChangeApplied -Change $record -Field Profile -Value @($narrowedProfile)
             }
         } catch {
             # Group-policy rules cannot be edited locally. The run stops on
@@ -1283,53 +1637,6 @@ Nothing after the firewall step was configured. -Disable puts back what this run
     }
 }
 
-function Merge-AdjustedRules {
-    param(
-        [AllowNull()]
-        [object]$Stored,
-
-        [AllowNull()]
-        [object]$Applied
-    )
-
-    # The prior values belong to the first run that touched a rule -- they are
-    # what -Disable puts back. The APPLIED values belong to the latest run,
-    # because they are what the rule should look like now: a rerun that narrows
-    # a rule further leaves it in a state the stored applied values no longer
-    # describe, and -Disable would then read this script's own second narrowing
-    # as somebody else's edit and abandon the rule.
-    $merged = @()
-    $seen = @{}
-
-    foreach ($record in @(@($Stored) | Where-Object { $_ })) {
-        $latest = @(@($Applied) | Where-Object { $_ -and $_.Name -eq $record.Name }) | Select-Object -First 1
-
-        if ($latest) {
-            $merged += [pscustomobject]@{
-                Name                 = $record.Name
-                RemoteAddress        = $record.RemoteAddress
-                Profile              = $record.Profile
-                Enabled              = $record.Enabled
-                AppliedRemoteAddress = $latest.AppliedRemoteAddress
-                AppliedProfile       = $latest.AppliedProfile
-                AppliedEnabled       = $latest.AppliedEnabled
-            }
-        } else {
-            $merged += $record
-        }
-
-        $seen[$record.Name] = $true
-    }
-
-    foreach ($record in @(@($Applied) | Where-Object { $_ })) {
-        if (-not $seen.ContainsKey($record.Name)) {
-            $merged += $record
-        }
-    }
-
-    $merged
-}
-
 function Save-EnableState {
     param(
         [Parameter(Mandatory = $true)]
@@ -1343,232 +1650,36 @@ function Save-EnableState {
         [object]$State
     )
 
-    # Only the first run to touch a component sees the machine's original
-    # setting for it. A rerun must not overwrite that with a value this script
-    # already wrote, or -Disable would restore this script's configuration
-    # instead of the machine's.
-    $state = $State
-
-    if (-not $state) {
-        Save-RemoteMcpState -State ([ordered]@{
-            DefaultShell        = $Mutation.DefaultShell
-            DefaultShellManaged = $Mutation.DefaultShellManaged
-            SshStartType        = $Mutation.SshStartType
-            SshWasRunning       = $Mutation.SshWasRunning
-            CapabilityInstalled = $Mutation.CapabilityInstalled
-            DefaultShellCommandOption = $Mutation.DefaultShellCommandOption
-            AuthorizedKeysAcls  = @($Mutation.AuthorizedKeysAcls)
-            AdjustedRules       = @($Mutation.AdjustedRules)
-            AuthorizedKeys      = @($Mutation.AuthorizedKeys)
-        })
-
-        return
-    }
-
-    $knownKeys = @(@($state.AuthorizedKeys) | ForEach-Object { "$($_.Path)|$($_.Key)" })
-
-    # A stored value for a component an earlier run never touched is not an
-    # original worth protecting: if that run skipped the default shell, or died
-    # before reaching the service, what THIS run found is the machine's own.
-    $defaultShell = if ($state.DefaultShellManaged) { $state.DefaultShell } else { $Mutation.DefaultShell }
-    $serviceKnown = $null -ne $state.SshStartType
-
-    # The first rebuild of a given file saw the machine's own DACL for it; a
-    # later run would only capture what this script already wrote. Per path,
-    # because a rerun can rebuild a different file's DACL entirely.
-    $knownAclPaths = @(@($state.AuthorizedKeysAcls) | ForEach-Object { $_.Path })
-
+    # One merge for every kind of change, in Merge-ChangeLedger. What used to
+    # be here was that rule written out per component -- a shell clause, a
+    # service clause, a rules clause, an ACL clause, a keys clause -- each with
+    # its own idea of when a stored value outranks this run's.
     Save-RemoteMcpState -State ([ordered]@{
-        DefaultShell        = $defaultShell
-        DefaultShellManaged = ([bool]$state.DefaultShellManaged -or $Mutation.DefaultShellManaged)
-        SshStartType        = $(if ($serviceKnown) { $state.SshStartType } else { $Mutation.SshStartType })
-        SshWasRunning       = $(if ($serviceKnown) { $state.SshWasRunning } else { $Mutation.SshWasRunning })
-        CapabilityInstalled = ([bool]$state.CapabilityInstalled -or $Mutation.CapabilityInstalled)
-        DefaultShellCommandOption = $(if ($state.DefaultShellManaged) { $state.DefaultShellCommandOption } else { $Mutation.DefaultShellCommandOption })
-        AuthorizedKeysAcls  = @(@($state.AuthorizedKeysAcls) + @($Mutation.AuthorizedKeysAcls | Where-Object { $knownAclPaths -notcontains $_.Path }))
-        AdjustedRules       = @(Merge-AdjustedRules -Stored $state.AdjustedRules -Applied $Mutation.AdjustedRules)
-        AuthorizedKeys      = @(@($state.AuthorizedKeys) + @($Mutation.AuthorizedKeys | Where-Object { $knownKeys -notcontains "$($_.Path)|$($_.Key)" }))
+        Version             = $StateVersion
+        CapabilityInstalled = ([bool]$State.CapabilityInstalled -or $Mutation.CapabilityInstalled)
+        Changes             = @(Merge-ChangeLedger -Stored $State.Changes -Applied $Mutation.Changes)
     })
 }
 
-function Test-RuleStillAsApplied {
+function ConvertTo-SshConfigQuoted {
     param(
         [Parameter(Mandatory = $true)]
-        [object]$Record
+        [AllowEmptyString()]
+        [string]$Value
     )
 
-    # A record written before this check existed cannot be verified; restoring
-    # is the contract it was written under.
-    if (-not $Record.AppliedEnabled) {
-        return $true
-    }
-
-    $rule = Get-NetFirewallRule -Name $Record.Name -ErrorAction SilentlyContinue
-    if (-not $rule) {
-        # Gone entirely. There is nothing to put back, and recreating it is not
-        # this script's business.
-        return $false
-    }
-
-    if ("$($rule.Enabled)" -ne "$($Record.AppliedEnabled)") {
-        return $false
-    }
-
-    $currentProfile = @("$($rule.Profile)" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    $appliedProfile = @($Record.AppliedProfile)
-    if (@(Compare-Object -ReferenceObject $appliedProfile -DifferenceObject $currentProfile).Count -gt 0) {
-        return $false
-    }
-
-    try {
-        $currentAddress = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
-    } catch {
-        return $false
-    }
-
-    $appliedAddress = @($Record.AppliedRemoteAddress)
-    @(Compare-Object -ReferenceObject $appliedAddress -DifferenceObject $currentAddress).Count -eq 0
-}
-
-function Disable-RemoteMcpFirewall {
-    param(
-        [Parameter(Mandatory = $true)]
-        [AllowNull()]
-        [object]$State,
-
-        # Rule records this run could not restore. What stays here is what a
-        # later -Disable still has to do; anything restored is dropped, so it
-        # is never re-applied over a scope someone set in the meantime.
-        [Parameter(Mandatory = $true)]
-        [AllowEmptyCollection()]
-        [System.Collections.ArrayList]$Remaining
-    )
-
-    $existingRule = Get-NetFirewallRule -Name $SshRuleId -ErrorAction SilentlyContinue
-    if ($existingRule) {
-        Remove-NetFirewallRule -Name $SshRuleId
-        Write-Host "  Firewall rule removed: $SshRuleName"
-    } else {
-        Write-Host "  Firewall rule not present: $SshRuleName"
-    }
-
-    if (-not $State) {
-        Write-Host "  No saved state at $StatePath; removed only this script's own firewall rule."
-        return
-    }
-
-    foreach ($record in @($State.AdjustedRules)) {
-        if (-not $record) {
-            continue
-        }
-
-        # Only where the rule is still exactly as this run left it. Anything
-        # else means somebody has changed it since, and their version wins:
-        # this script relinquishes the rule rather than reinstating a scope
-        # that is no longer anyone's intent. Dropped from the record too --
-        # ownership has moved, so a later run should not keep trying.
-        if (-not (Test-RuleStillAsApplied -Record $record)) {
-            Write-Host "  Left alone, changed since this script narrowed it: $($record.Name)"
-            continue
-        }
-
-        # Each step that succeeds moves the record's idea of the rule's current
-        # state forward. Without that, a retry after a half-finished restore
-        # would compare the rule against what enable applied, find the part
-        # already put back, and take this script's own work for somebody
-        # else's edit -- abandoning the rest.
-        $progress = [pscustomobject]@{
-            Name                 = $record.Name
-            RemoteAddress        = $record.RemoteAddress
-            Profile              = $record.Profile
-            Enabled              = $record.Enabled
-            AppliedRemoteAddress = $record.AppliedRemoteAddress
-            AppliedProfile       = $record.AppliedProfile
-            AppliedEnabled       = $record.AppliedEnabled
-        }
-
-        try {
-            Set-NetFirewallRule -Name $record.Name -RemoteAddress @($record.RemoteAddress)
-            $progress.AppliedRemoteAddress = $record.RemoteAddress
-
-            if ($record.Profile) {
-                Set-NetFirewallRule -Name $record.Name -Profile @($record.Profile)
-                $progress.AppliedProfile = $record.Profile
-            }
-            if ($record.Enabled) {
-                Set-NetFirewallRule -Name $record.Name -Enabled $record.Enabled
-                $progress.AppliedEnabled = $record.Enabled
-            }
-
-            Write-Host "  Restored SSH exception: $($record.Name) ($(@($record.RemoteAddress) -join ', ')$(if ($record.Profile) { " on $(@($record.Profile) -join ', ')" }))"
-        } catch {
-            Write-Warning "  Could not restore '$($record.Name)': $($_.Exception.Message)"
-            $script:UnfinishedRestore += "firewall rule $($record.Name)"
-            $script:RestoreFailed = $true
-            [void]$Remaining.Add($progress)
-        }
-    }
-}
-
-function Restore-AuthorizedKeysAcl {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Record
-    )
-
-    if (-not (Test-Path $Record.Path)) {
-        Write-Host "  Authorized keys file already gone; ACL not restored: $($Record.Path)"
-        return
-    }
-
-    # Only the DACL, which is the only part the rebuild replaced.
-    $acl = Get-Acl -Path $Record.Path
-    $acl.SetSecurityDescriptorSddlForm($Record.Sddl, [System.Security.AccessControl.AccessControlSections]::Access)
-    Set-Acl -Path $Record.Path -AclObject $acl
-
-    Write-Host "  ACL restored on $($Record.Path)"
-}
-
-function Restore-SshService {
-    param(
-        [Parameter(Mandatory = $true)]
-        [AllowNull()]
-        [object]$State,
-
-        [Parameter(Mandatory = $true)]
-        [object]$Remaining
-    )
-
-    if (-not $State -or -not $State.SshStartType) {
-        Write-Host "  No saved state; sshd left as it is."
-        return
-    }
-
-    # Put sshd back where this script found it -- but never remove the
-    # capability, because uninstalling it discards the host keys and changes
-    # the fingerprint every client has already accepted.
-    try {
-        $startType = if ($State.CapabilityInstalled) { "Manual" } else { "$($State.SshStartType)" }
-        Set-Service -Name sshd -StartupType $startType
-
-        if ($State.CapabilityInstalled -or -not $State.SshWasRunning) {
-            # No -ErrorAction SilentlyContinue: a suppressed failure here would
-            # print "stopped" over a service still running, skip the catch
-            # below, and let the state file be deleted with no record to retry
-            # from. Stopping an already-stopped service is not an error.
-            Stop-Service -Name sshd -Force
-            Write-Host "  sshd stopped; startup type $startType."
-        } else {
-            Write-Host "  sshd left running; startup type restored to $startType."
-        }
-    } catch {
-        Write-Warning "  Could not restore the sshd service: $($_.Exception.Message)"
-        $script:UnfinishedRestore += "the sshd service"
-        $script:RestoreFailed = $true
-        $Remaining.SshStartType = $State.SshStartType
-        $Remaining.SshWasRunning = $State.SshWasRunning
-        $Remaining.CapabilityInstalled = $State.CapabilityInstalled
-    }
+    # ssh_config splits an unquoted value on whitespace, so every value that
+    # could contain a space is emitted quoted. Inside those quotes a backslash
+    # escapes the next character, which two things follow from: a value holding
+    # a double quote needs it escaped or ssh rejects the line outright
+    # ("invalid quotes"), and a value holding a backslash needs it doubled or
+    # the character after it is eaten. A client-side identity path is the one
+    # that reaches both -- POSIX filenames may contain a double quote, and a
+    # Windows-style path is all backslashes.
+    #
+    # Verified against OpenSSH 9.6: "/tmp/a\"b" resolves to /tmp/a"b, while
+    # both "/tmp/a"b" and an unquoted /tmp/a"b are refused at parse time.
+    '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
 }
 
 function ConvertTo-PosixSingleQuoted {
@@ -1581,6 +1692,216 @@ function ConvertTo-PosixSingleQuoted {
     # every quote is closed, escaped and reopened: ' becomes '\''. Windows
     # paths cannot contain a double quote, so nothing else needs escaping.
     "'" + $Value.Replace("'", "'\''") + "'"
+}
+
+# ---------------------------------------------------------------------------
+# Change adapters
+# ---------------------------------------------------------------------------
+#
+# All a component supplies: how to read its current values, and how to write
+# one of them. The four ownership rules above are the ledger's, so a component
+# added later gets them without having to know they exist -- which is the
+# whole reason this exists rather than a fifth hand-written restore path.
+#
+# Read returns a field map, or $null when the thing itself is gone.
+# Write takes one field and one value, and is expected to throw on failure.
+
+$ChangeAdapters = @{
+
+    FirewallRule = @{
+        Read = {
+            param($Id)
+
+            $rule = Get-NetFirewallRule -Name $Id -ErrorAction SilentlyContinue
+            if (-not $rule) {
+                return $null
+            }
+
+            $address = try {
+                @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
+            } catch {
+                # The rule is there but its address filter will not read. Not
+                # knowing the scope is not the same as the scope having
+                # changed, but it is equally not a basis for writing over it.
+                return $null
+            }
+
+            [ordered]@{
+                RemoteAddress = $address
+                Profile       = @("$($rule.Profile)" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                Enabled       = "$($rule.Enabled)"
+            }
+        }
+        Write = {
+            param($Id, $Field, $Value)
+
+            switch ($Field) {
+                "RemoteAddress" { Set-NetFirewallRule -Name $Id -RemoteAddress @($Value) }
+                "Profile"       { Set-NetFirewallRule -Name $Id -Profile @($Value) }
+                "Enabled"       { Set-NetFirewallRule -Name $Id -Enabled "$Value" }
+                default         { throw "Unknown firewall rule field '$Field'." }
+            }
+        }
+    }
+
+    DefaultShell = @{
+        Read = {
+            param($Id)
+
+            if (-not (Test-Path $OpenSshKeyPath)) {
+                return $null
+            }
+
+            [ordered]@{
+                Shell         = Get-OpenSshValue -Name $DefaultShellValueName
+                CommandOption = Get-OpenSshValue -Name $DefaultShellCommandOptionValueName
+            }
+        }
+        Write = {
+            param($Id, $Field, $Value)
+
+            switch ($Field) {
+                "Shell"         { Set-OpenSshValue -Name $DefaultShellValueName -Value $Value }
+                "CommandOption" { Set-OpenSshValue -Name $DefaultShellCommandOptionValueName -Value $Value }
+                default         { throw "Unknown default shell field '$Field'." }
+            }
+        }
+    }
+
+    SshService = @{
+        Read = {
+            param($Id)
+
+            $service = Get-Service -Name $Id -ErrorAction SilentlyContinue
+            if (-not $service) {
+                return $null
+            }
+
+            [ordered]@{
+                StartType = "$($service.StartType)"
+                Running   = "$($service.Status -eq 'Running')"
+            }
+        }
+        Write = {
+            param($Id, $Field, $Value)
+
+            switch ($Field) {
+                "StartType" { Set-Service -Name $Id -StartupType "$Value" }
+                "Running"   {
+                    if ("$Value" -eq "True") {
+                        Start-Service -Name $Id
+                    } else {
+                        # No -ErrorAction SilentlyContinue: a suppressed failure
+                        # would report the service stopped while it ran on, and
+                        # let the record be dropped with nothing to retry from.
+                        # Stopping an already-stopped service is not an error.
+                        Stop-Service -Name $Id -Force
+                    }
+                }
+                default     { throw "Unknown sshd service field '$Field'." }
+            }
+        }
+    }
+
+    AuthorizedKey = @{
+        # Id is "<path>|<type> <blob>": the file, and the credential sshd
+        # actually authenticates on. Not the whole line -- a comment edited by
+        # hand afterwards must not hide a key this script installed, which
+        # would have -Disable report a live credential removed.
+        Read = {
+            param($Id)
+
+            $path, $identity = "$Id" -split "\|", 2
+            if (-not (Test-Path $path)) {
+                return $null
+            }
+
+            $present = $false
+            foreach ($line in @(Get-Content -Path $path)) {
+                if ((Get-AuthorizedKeyIdentity -Line $line) -eq $identity) {
+                    $present = $true
+                    break
+                }
+            }
+
+            [ordered]@{ Present = "$present" }
+        }
+        Write = {
+            param($Id, $Field, $Value)
+
+            $path, $identity = "$Id" -split "\|", 2
+            if ($Field -ne "Present") {
+                throw "Unknown authorized key field '$Field'."
+            }
+            if ("$Value" -eq "True") {
+                throw "This script does not reinstall a key it removed."
+            }
+
+            Remove-AuthorizedKey -Path $path -Identity $identity
+        }
+    }
+
+    KeyFileTerminator = @{
+        # A file whose last line had no newline gets one, so the new key does
+        # not land on the end of it. That byte is this script's too. It is a
+        # change on the FILE rather than on any one key, which is why it is its
+        # own entry: two enable runs append two keys and only the first records
+        # a terminator, so trimming as that first key came out would take the
+        # second key's newline instead. Ordered after every key on the same
+        # path, so by the time it runs there is nothing of this script's left
+        # in the file.
+        Read = {
+            param($Id)
+
+            if (-not (Test-Path $Id)) {
+                return $null
+            }
+
+            $bytes = [System.IO.File]::ReadAllBytes($Id)
+            $terminated = $bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -eq 10
+
+            [ordered]@{ Terminated = "$terminated" }
+        }
+        Write = {
+            param($Id, $Field, $Value)
+
+            if ($Field -ne "Terminated") {
+                throw "Unknown key file field '$Field'."
+            }
+            if ("$Value" -eq "True") {
+                throw "This script does not add a terminator on the way out."
+            }
+
+            Remove-AuthorizedKeySeparator -Path $Id
+        }
+    }
+
+    AuthorizedKeysAcl = @{
+        Read = {
+            param($Id)
+
+            if (-not (Test-Path $Id)) {
+                return $null
+            }
+
+            # Only the DACL, which is the only part the rebuild replaced.
+            [ordered]@{
+                Sddl = (Get-Acl -Path $Id).GetSecurityDescriptorSddlForm(
+                    [System.Security.AccessControl.AccessControlSections]::Access)
+            }
+        }
+        Write = {
+            param($Id, $Field, $Value)
+
+            if ($Field -ne "Sddl") {
+                throw "Unknown ACL field '$Field'."
+            }
+
+            $acl = Get-Acl -Path $Id
+            $acl.SetSecurityDescriptorSddlForm("$Value", [System.Security.AccessControl.AccessControlSections]::Access)
+            Set-Acl -Path $Id -AclObject $acl
+        }
+    }
 }
 
 function Get-VMIPv4Address {
@@ -1634,127 +1955,109 @@ if ($Disable) {
         Write-Warning $_.Exception.Message
     }
 
-    # What this run leaves undone, in the shape of the record itself. A
-    # component that WAS put back is dropped rather than carried, so a retry
-    # only retries what is outstanding: keeping a restored component would let
-    # a later -Disable re-apply the value from before the first enable over
-    # whatever was configured in the meantime.
-    $remaining = [ordered]@{
-        DefaultShell              = $null
-        DefaultShellManaged       = $false
-        DefaultShellCommandOption = $null
-        SshStartType              = $null
-        SshWasRunning             = $null
-        CapabilityInstalled       = $false
-        AuthorizedKeysAcls        = New-Object System.Collections.ArrayList
-        AdjustedRules             = New-Object System.Collections.ArrayList
-        AuthorizedKeys            = New-Object System.Collections.ArrayList
-    }
+    # What this run leaves undone, as ledger entries. A change that WAS put
+    # back is dropped rather than carried, so a retry only retries what is
+    # outstanding: keeping a restored change would let a later -Disable
+    # re-apply the value from before the first enable over whatever was
+    # configured in the meantime.
+    $remaining = New-Object System.Collections.ArrayList
+    $ledger = ConvertTo-ChangeLedger -Entries $(if ($state) { $state.Changes })
+
+    # A -Skip switch holds back a whole kind. Named here rather than checked
+    # inside the loop, so adding a kind does not mean finding every place a
+    # switch might apply to it.
+    $skipped = @{}
+    if ($SkipFirewall)     { $skipped["FirewallRule"] = "-SkipFirewall" }
+    if ($SkipDefaultShell) { $skipped["DefaultShell"] = "-SkipDefaultShell" }
+    if ($SkipKeys)         { $skipped["AuthorizedKey"] = "-SkipKeys"; $skipped["KeyFileTerminator"] = "-SkipKeys" }
 
     Write-Host "Closing remote MCP access:"
 
+    # This script's own rule is not a ledger entry: nothing else had it, so
+    # there is nothing to put back and nothing to compare against.
     if ($SkipFirewall) {
-        Write-Host "  Skipped firewall changes (-SkipFirewall specified)."
-        $script:UnfinishedRestore += "the firewall (-SkipFirewall)"
-        foreach ($record in @(@($state.AdjustedRules) | Where-Object { $_ })) {
-            [void]$remaining.AdjustedRules.Add($record)
-        }
+        Write-Host "  Left this script's own firewall rule in place (-SkipFirewall specified)."
     } else {
-        Disable-RemoteMcpFirewall -State $state -Remaining $remaining.AdjustedRules
+        $existingRule = Get-NetFirewallRule -Name $SshRuleId -ErrorAction SilentlyContinue
+        if ($existingRule) {
+            Remove-NetFirewallRule -Name $SshRuleId
+            Write-Host "  Firewall rule removed: $SshRuleName"
+        } else {
+            Write-Host "  Firewall rule not present: $SshRuleName"
+        }
     }
 
-    if ($SkipDefaultShell) {
-        Write-Host "  Skipped default shell (-SkipDefaultShell specified)."
-        $script:UnfinishedRestore += "the default shell (-SkipDefaultShell)"
-        if ($state) {
-            $remaining.DefaultShell = $state.DefaultShell
-            $remaining.DefaultShellManaged = [bool]$state.DefaultShellManaged
-            $remaining.DefaultShellCommandOption = $state.DefaultShellCommandOption
-        }
+    if ($stateUnreadable) {
+        # Nothing else can be attempted: the record is the only thing that says
+        # what to put back.
+        $ledger = New-Object System.Collections.ArrayList
     } elseif (-not $state) {
-        Write-Host "  No saved state; default shell left alone."
-    } elseif (-not $state.DefaultShellManaged) {
-        # This script never wrote the value, so there is no evidence it owns
-        # the one that is there now. Deleting it would silently undo a shell
-        # configured independently.
-        Write-Host "  Default shell was not set by this script; left alone."
-    } else {
-        try {
-            Restore-SshDefaultShell -Value $state.DefaultShell -CommandOption $state.DefaultShellCommandOption
-        } catch {
-            Write-Warning "  Could not restore the default shell: $($_.Exception.Message)"
-            $script:UnfinishedRestore += "the default shell"
-            $script:RestoreFailed = $true
-            $remaining.DefaultShell = $state.DefaultShell
-            $remaining.DefaultShellManaged = $true
-            $remaining.DefaultShellCommandOption = $state.DefaultShellCommandOption
-        }
+        Write-Host "  No saved state at $StatePath; removed only this script's own firewall rule."
+    } elseif (@($ledger).Count -eq 0) {
+        Write-Host "  The record lists nothing outstanding."
     }
 
-    # Files still holding a managed key after this step. Their ACLs stay
-    # tightened: see below.
-    $keysOutstanding = @()
-
-    if ($SkipKeys) {
-        Write-Host "  Left installed keys in place (-SkipKeys specified)."
-        $script:UnfinishedRestore += "the installed keys (-SkipKeys)"
-        foreach ($record in @(@($state.AuthorizedKeys) | Where-Object { $_ })) {
-            [void]$remaining.AuthorizedKeys.Add($record)
-        }
-    } elseif ($state) {
-        $records = @(@($state.AuthorizedKeys) | Where-Object { $_ })
-        if ($records.Count -eq 0) {
-            Write-Host "  No keys were installed by this script."
+    # One loop. Ordered so that a key comes out before the file's terminator,
+    # and both before the DACL that protects them -- restoring a DACL needs to
+    # happen after the writes that need the access it gives away.
+    foreach ($change in Get-OrderedChanges -Ledger $ledger) {
+        if ($skipped.ContainsKey("$($change.Kind)")) {
+            Write-Host "  Left as it is, $($skipped["$($change.Kind)"]) specified: $($change.Label)"
+            $script:UnfinishedRestore += "$($change.Label) ($($skipped["$($change.Kind)"]))"
+            [void]$remaining.Add($change)
+            continue
         }
 
-        foreach ($record in $records) {
-            try {
-                Remove-AuthorizedKey -Path $record.Path -Key $record.Key -AddedSeparator ([bool]$record.AddedSeparator)
-            } catch {
-                Write-Warning "  Could not remove key from '$($record.Path)': $($_.Exception.Message)"
-                $script:UnfinishedRestore += "key in $($record.Path)"
-                $script:RestoreFailed = $true
-                [void]$remaining.AuthorizedKeys.Add($record)
-                $keysOutstanding += $record.Path
-            }
-        }
-    } else {
-        Write-Host "  No saved state; authorized keys left alone."
-    }
+        # Anything of this script's on the same file that is still outstanding
+        # holds this one back. That is what keeps a DACL tightened while a key
+        # it protects is still installed -- handing back write access to live
+        # credentials is worse than leaving the ACL alone -- and what keeps the
+        # file's terminator until every key is out of it.
+        if ($change.Scope) {
+            $blocking = @(@($remaining) | Where-Object {
+                $_.Scope -eq $change.Scope -and $ChangeOrder["$($_.Kind)"] -lt $ChangeOrder["$($change.Kind)"]
+            })
 
-    # After the keys, not before: removing them needs the write access this is
-    # about to give away.
-    if ($SkipKeys) {
-        # The keys are still in the files, so the ACLs that protect them stay.
-        foreach ($record in @(@($state.AuthorizedKeysAcls) | Where-Object { $_ })) {
-            [void]$remaining.AuthorizedKeysAcls.Add($record)
-        }
-    } elseif ($state) {
-        foreach ($record in @(@($state.AuthorizedKeysAcls) | Where-Object { $_ })) {
-            # Only for a file whose managed key is actually gone. Handing back
-            # a DACL that let another principal write, while a login key this
-            # script installed is still in the file, would leave that principal
-            # able to edit live credentials -- so the tightened ACL stays until
-            # the key it protects has been removed.
-            if ($keysOutstanding -contains $record.Path) {
-                Write-Host "  ACL left tightened on $($record.Path); the key in it is still installed."
-                $script:UnfinishedRestore += "the ACL on $($record.Path)"
-                [void]$remaining.AuthorizedKeysAcls.Add($record)
+            if ($blocking.Count -gt 0) {
+                Write-Host "  Left as it is, $($blocking[0].Label) is still in place: $($change.Label)"
+                $script:UnfinishedRestore += $change.Label
+                [void]$remaining.Add($change)
                 continue
             }
+        }
 
-            try {
-                Restore-AuthorizedKeysAcl -Record $record
-            } catch {
-                Write-Warning "  Could not restore the ACL on '$($record.Path)': $($_.Exception.Message)"
-                $script:UnfinishedRestore += "the ACL on $($record.Path)"
-                $script:RestoreFailed = $true
-                [void]$remaining.AuthorizedKeysAcls.Add($record)
-            }
+        # Rule 3. Only where the machine still holds what this script wrote.
+        # Anything else belongs to whoever changed it since, and is dropped
+        # from the record as well as left alone: ownership has moved, so a
+        # later run should not keep trying.
+        try {
+            $drift = Get-ChangeDrift -Change $change
+        } catch {
+            Write-Warning "  Could not read $($change.Label) to check it ($($_.Exception.Message)); left alone."
+            $script:UnfinishedRestore += $change.Label
+            $script:RestoreFailed = $true
+            [void]$remaining.Add($change)
+            continue
+        }
+
+        if ($drift.Count -gt 0) {
+            Write-Host "  Left alone, changed since this script set it ($($drift -join ', ')): $($change.Label)"
+            continue
+        }
+
+        # Rule 2 on the way out: Restore-ManagedChange advances Applied as each
+        # field is written, so what lands in $remaining after a failure says
+        # how far this got rather than where it started.
+        try {
+            Restore-ManagedChange -Change $change
+            Write-Host "  Restored: $($change.Label)"
+        } catch {
+            Write-Warning "  Could not restore $($change.Label): $($_.Exception.Message)"
+            $script:UnfinishedRestore += $change.Label
+            $script:RestoreFailed = $true
+            [void]$remaining.Add($change)
         }
     }
-
-    Restore-SshService -State $state -Remaining $remaining
 
     if ($stateUnreadable) {
         Write-Host ""
@@ -1764,32 +2067,26 @@ if ($Disable) {
         # here is usually transient -- a group-policy rule, a service
         # mid-transition. Write back just that, so a later -Disable picks up
         # where this one stopped without re-applying anything already restored.
-        $stillChanged = (
-            $remaining.DefaultShellManaged -or
-            $null -ne $remaining.SshStartType -or
-            @($remaining.AdjustedRules).Count -gt 0 -or
-            @($remaining.AuthorizedKeys).Count -gt 0 -or
-            @($remaining.AuthorizedKeysAcls).Count -gt 0
-        )
+        $reduced = [ordered]@{
+            Version             = $StateVersion
+            CapabilityInstalled = [bool]$state.CapabilityInstalled
+            Changes             = @($remaining)
+        }
 
-        if ($stillChanged) {
-            $remaining.AuthorizedKeysAcls = @($remaining.AuthorizedKeysAcls)
-            $remaining.AdjustedRules = @($remaining.AdjustedRules)
-            $remaining.AuthorizedKeys = @($remaining.AuthorizedKeys)
-
+        if (@($remaining).Count -gt 0) {
             Write-Host ""
             try {
-                Save-RemoteMcpState -State $remaining
+                Save-RemoteMcpState -State $reduced
                 Write-Warning "Kept $StatePath -- not put back: $($script:UnfinishedRestore -join '; '). Rerun -Disable once the cause is fixed; what it already restored has been dropped from the record."
             } catch {
                 # The writer leaves the previous file intact when it cannot
                 # swap in the new one -- which is right for the record, but
-                # that file still lists components this run has already put
-                # back, and a later -Disable reading it would treat them as
+                # that file still lists changes this run has already put back,
+                # and a later -Disable reading it would treat them as
                 # outstanding. Say so rather than let that be discovered later.
                 $script:RestoreFailed = $true
                 Write-Warning "Could not write the reduced record to $StatePath ($($_.Exception.Message))."
-                Write-Warning "$StatePath still describes the state before this run and now over-describes it: it lists components this run already restored. Rerunning -Disable against it would try to put those back a second time. Not put back this run: $($script:UnfinishedRestore -join '; '). Reconcile or remove that file before rerunning."
+                Write-Warning "$StatePath still describes the state before this run and now over-describes it: it lists changes this run already restored. Rerunning -Disable against it would try to put those back a second time. Not put back this run: $($script:UnfinishedRestore -join '; '). Reconcile or remove that file before rerunning."
             }
         } else {
             # Everything is back, so the record should go. If it cannot be
@@ -1803,14 +2100,11 @@ if ($Disable) {
             } catch {
                 Write-Warning "Could not remove $StatePath ($($_.Exception.Message)); emptying it instead so a later -Disable does not act on it."
                 try {
-                    $remaining.AuthorizedKeysAcls = @()
-                    $remaining.AdjustedRules = @()
-                    $remaining.AuthorizedKeys = @()
-                    Save-RemoteMcpState -State $remaining
+                    Save-RemoteMcpState -State $reduced
                     Write-Host "  $StatePath emptied; it records nothing outstanding. Remove it when you can."
                 } catch {
                     $script:RestoreFailed = $true
-                    Write-Warning "Could not empty $StatePath either ($($_.Exception.Message)). It still describes the state before this run, and a later -Disable reading it would try to restore components this run already put back. Remove that file by hand."
+                    Write-Warning "Could not empty $StatePath either ($($_.Exception.Message)). It still describes the state before this run, and a later -Disable reading it would try to restore changes this run already put back. Remove that file by hand."
                 }
             }
         }
@@ -1907,15 +2201,12 @@ if (-not $PSCmdlet.ShouldProcess("OpenSSH server", "Open remote MCP access over 
 # Recording nothing would strand the machine: the next enable would capture the
 # already-modified firewall scope and default shell as the originals.
 $mutation = [ordered]@{
-    DefaultShell        = $null
-    DefaultShellManaged = $false
-    SshStartType        = $null
-    SshWasRunning       = $null
+    # Not a ledger entry: the capability is never uninstalled, because that
+    # discards the host keys and changes the fingerprint every client has
+    # already accepted. It is here because it decides what the sshd service's
+    # "original" startup type is.
     CapabilityInstalled = $false
-    DefaultShellCommandOption = $null
-    AuthorizedKeysAcls  = New-Object System.Collections.ArrayList
-    AdjustedRules       = New-Object System.Collections.ArrayList
-    AuthorizedKeys      = New-Object System.Collections.ArrayList
+    Changes             = New-Object System.Collections.ArrayList
 }
 
 $setupFailed = $false
@@ -1934,13 +2225,13 @@ try {
             -Port $Port `
             -RemoteAddress $ClientAddress `
             -FirewallProfile $FirewallProfile `
-            -AdjustedRule $mutation.AdjustedRules
+            -Ledger $mutation.Changes
     }
 
     Write-Host ""
     Write-Host "[3/4] Default shell:"
     if ($SkipDefaultShell) {
-        # Deliberately leaves DefaultShellManaged false: a value this script
+        # Records no change, which is what makes it safe: a value this script
         # never wrote is not one -Disable may delete.
         Write-Host "  Skipped (-SkipDefaultShell specified). An MCP transport needs cmd.exe here; PowerShell rewrites the stream."
     } else {
@@ -1964,14 +2255,7 @@ try {
 
         # Recorded before the ACL call, which can throw with the key already on
         # disk -- a key installed and not recorded is one -Disable never removes.
-        $added = Add-AuthorizedKey -Path $authorizedKeysPath -Key $resolvedKey
-        if ($added.Added) {
-            [void]$mutation.AuthorizedKeys.Add([pscustomobject]@{
-                Path           = $authorizedKeysPath
-                Key            = $resolvedKey
-                AddedSeparator = $added.AddedSeparator
-            })
-        }
+        Add-AuthorizedKey -Path $authorizedKeysPath -Key $resolvedKey -Mutation $mutation
 
         Set-AuthorizedKeysAcl `
             -Path $authorizedKeysPath `
@@ -2049,9 +2333,9 @@ Write-Host @"
 On the client, give this VM a stable name in ~/.ssh/config:
 
   Host $SshHostAlias
-      HostName "$sshHostName"
-      User "$User"$portLine
-      IdentityFile "$ClientIdentityFile"
+      HostName $(ConvertTo-SshConfigQuoted -Value $sshHostName)
+      User $(ConvertTo-SshConfigQuoted -Value $User)$portLine
+      IdentityFile $(ConvertTo-SshConfigQuoted -Value $ClientIdentityFile)
       RequestTTY no
       BatchMode yes
       ServerAliveInterval 30
