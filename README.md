@@ -311,11 +311,20 @@ powershell -ExecutionPolicy RemoteSigned -File C:\Setup-RemoteMcp.ps1 -Disable
 ```
 
 Prior scope, profile, and enabled state of every rule it touched, the previous default shell, the
-sshd startup type, and the keys it installed go to
+sshd startup type and running state, and the keys it installed go to
 `C:\ProgramData\agent-sandbox\remote-mcp-ssh.json` so `-Disable` puts them back exactly. Rerunning
-enable never overwrites that record. `-Disable` leaves the OpenSSH capability and its host keys
-installed, because removing them would change the fingerprint every client has already accepted;
-`-SkipKeys` keeps the installed keys when only the network exposure is being closed.
+enable never overwrites that record, and a run that fails part way still records what it had already
+changed -- a machine left modified with nothing written down is one `-Disable` cannot help.
+
+The record also tracks *which* components the script actually wrote, so `-Disable` only reverts
+those: after an enable with `-SkipDefaultShell`, it leaves a `DefaultShell` someone else configured
+alone rather than deleting it. And it survives a `-Disable` that could not finish -- a firewall rule
+held by group policy, a `-Skip` switch -- so a later run can pick up where that one stopped; the run
+says what is still outstanding.
+
+`-Disable` leaves the OpenSSH capability and its host keys installed, because removing them would
+change the fingerprint every client has already accepted; `-SkipKeys` keeps the installed keys when
+only the network exposure is being closed.
 
 ### Restore to clean state
 
