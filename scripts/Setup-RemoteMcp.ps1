@@ -263,18 +263,35 @@ function Save-RemoteMcpState {
 #   Applied   what this script last successfully wrote
 #
 # Restore order is by Kind, and within a Scope the lower Order goes first.
-# That one rule produces the two orderings that were previously special cases:
-# a key comes out before the file's terminator, and both before the DACL that
+# That one rule produces the orderings that were previously special cases: a
+# key comes out before the file's terminator, and both before the DACL that
 # protects them -- because removing a key needs the write access the DACL
 # restore gives away.
+#
+# The order is also the order a run that is CLOSING access has to work in.
+# Everything that takes access away goes first, and everything that hands
+# somebody else's broader configuration back goes last -- otherwise -Disable
+# widens the firewall to the machine's original scope while the key it
+# installed is still in the file and sshd is still listening, which is a few
+# seconds of the machine being more open than at any point while remote access
+# was deliberately on.
+#
+# The cost, worth knowing: sshd stops first, so a -Disable run OVER the very
+# ssh access it is closing loses its session part way through. That is not the
+# way this script is meant to be run -- it lives on the guest and is run there
+# -- and the record it leaves is safe to retry, since a field already restored
+# equals its Original and is skipped.
+# Stands in for a field name when the thing a change describes no longer
+# exists at all. Bracketed so it can never collide with one.
+$ChangeGone = "(gone)"
 
 $ChangeOrder = [ordered]@{
-    FirewallRule      = 10
-    DefaultShell      = 20
-    AuthorizedKey     = 30
-    KeyFileTerminator = 40
-    AuthorizedKeysAcl = 50
-    SshService        = 60
+    SshService        = 10
+    AuthorizedKey     = 20
+    KeyFileTerminator = 30
+    AuthorizedKeysAcl = 40
+    DefaultShell      = 50
+    FirewallRule      = 60
 }
 
 function New-ManagedChange {
@@ -395,7 +412,9 @@ function Get-ChangeDrift {
     if ($null -eq $live) {
         # The thing itself is gone -- a deleted rule, a removed file. There is
         # nothing to put back and recreating it is not this script's business.
-        return @("(gone)")
+        # Deliberately not a field name: the caller treats it as the whole
+        # change having moved on, never as one field of it.
+        return @($ChangeGone)
     }
 
     $drift = @()
@@ -412,7 +431,20 @@ function Get-ChangeDrift {
 }
 
 function Restore-ManagedChange {
-    param([Parameter(Mandatory = $true)][object]$Change)
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Change,
+
+        # The fields this script still owns. Anything not named here has been
+        # changed by somebody else since and is left to them.
+        #
+        # Not $Field: PowerShell variable names are case-insensitive, so a
+        # parameter by that name is clobbered by the $field loop variable
+        # below on the first iteration.
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Owned
+    )
 
     # Field by field, advancing Applied as each write returns. A write that
     # throws leaves the entry describing exactly how far this got, so the
@@ -422,6 +454,9 @@ function Restore-ManagedChange {
     $adapter = Get-ChangeAdapter -Kind $Change.Kind
 
     foreach ($field in @($Change.Original.Keys)) {
+        if ($Owned -notcontains $field) {
+            continue
+        }
         if (Test-ChangeValueEqual -Left $Change.Applied[$field] -Right $Change.Original[$field]) {
             continue
         }
@@ -1771,6 +1806,13 @@ $ChangeAdapters = @{
     }
 
     DefaultShell = @{
+        # All or nothing. The shell and its command option have to agree --
+        # sshd runs `<shell> <option> ...`, and cmd.exe wants /c while pwsh
+        # wants -Command -- so putting one back over an administrator's other
+        # half produces a combination neither party chose and no exec request
+        # survives. Every other kind's fields stand alone and are restored
+        # one by one.
+        Coupled = $true
         Read = {
             param($Id)
 
@@ -2066,7 +2108,21 @@ if ($Disable) {
             continue
         }
 
-        if ($drift.Count -gt 0) {
+        # Ownership is per field, not per change. Treating any drift as
+        # ownership of the whole thing moving abandons fields nobody else
+        # touched: an administrator setting sshd to Disabled would leave it
+        # RUNNING for ever, because this run started it and then declined to
+        # stop it. It also strands this script's own narrowing on a firewall
+        # rule it has just disowned, with nothing left on record to undo it.
+        #
+        # A kind whose fields cannot be separated says so, and keeps the older
+        # all-or-nothing behaviour.
+        # "(gone)" is not a field: the thing itself has been deleted, so there
+        # is no field of it to own and nothing to write.
+        $coupled = [bool]((Get-ChangeAdapter -Kind $change.Kind).Coupled) -or ($drift -contains $ChangeGone)
+        $owned = @(@($change.Original.Keys) | Where-Object { $drift -notcontains $_ })
+
+        if ($drift.Count -gt 0 -and ($coupled -or $owned.Count -eq 0)) {
             Write-Host "  Left alone, changed since this script set it ($($drift -join ', ')): $($change.Label)"
             continue
         }
@@ -2075,8 +2131,13 @@ if ($Disable) {
         # field is written, so what lands in $remaining after a failure says
         # how far this got rather than where it started.
         try {
-            Restore-ManagedChange -Change $change
-            Write-Host "  Restored: $($change.Label)"
+            Restore-ManagedChange -Change $change -Owned $owned
+
+            if ($drift.Count -gt 0) {
+                Write-Host "  Restored: $($change.Label) -- except $($drift -join ', '), changed since this script set it"
+            } else {
+                Write-Host "  Restored: $($change.Label)"
+            }
         } catch {
             Write-Warning "  Could not restore $($change.Label): $($_.Exception.Message)"
             $script:UnfinishedRestore += $change.Label
