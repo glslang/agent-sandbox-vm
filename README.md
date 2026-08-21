@@ -282,10 +282,12 @@ scripted rather than described:
   allowlist -- firewall allow rules are additive, so a narrow rule cannot claw back a wider one.
   A rule counts as being on that port whether its filter names the port exactly or a range spanning
   it, and a rule that cannot be narrowed -- one managed by group policy, typically -- fails the run
-  rather than letting it report a boundary the rule still overrides. One whose filter is `LocalPort Any` is *reported* rather than rescoped: such a rule is usually
-  scoped to a program rather than to a port, making it an app's inbound rule rather than an ssh
-  hole, and narrowing every one of them to the ssh client would take the VM's other inbound traffic
-  down with it. Reclassifying the network to `Private` instead would work in one line, at the cost of activating
+  rather than letting it report a boundary the rule still overrides. One whose filter is `LocalPort Any` is never
+  rescoped -- such a rule is usually scoped to a program rather than to a port, and narrowing every
+  one of them to the ssh client would take the VM's other inbound traffic down with it -- but its
+  program and service filters are read to see whether it can reach sshd at all. One that cannot is
+  ignored by name; one that can fails the run alongside the rules that would not narrow, since
+  either way `-ClientAddress` is not the boundary the summary would report. Reclassifying the network to `Private` instead would work in one line, at the cost of activating
   every other `Private` inbound rule: file and printer sharing, network discovery.
 - **The default shell.** OpenSSH runs an exec request through it. `cmd /c` hands the child the
   inherited pipe handles and stays out of the way; PowerShell captures the output through its own
@@ -299,7 +301,11 @@ scripted rather than described:
 - **Which authorized-keys file.** For a member of the Administrators group -- which the VM user is if
   you are kernel debugging -- sshd ignores `~/.ssh/authorized_keys` and reads
   `C:\ProgramData\ssh\administrators_authorized_keys`. A key in the other file is not an error
-  anywhere; it is just a login that never authenticates. Membership is resolved through nested
+  anywhere; it is just a login that never authenticates. The key is appended to that file, never
+  written over it, so other keys and comments in it survive; a file starting with a byte-order mark
+  is refused instead -- sshd reads it as plain bytes, so a UTF-16 file (what Windows PowerShell
+  redirection writes by default) is already not being read the way it looks. Membership is resolved
+  through nested
   groups, since sshd reads it off the logon token. Where it cannot be resolved -- a domain group in
   the chain, which no local lookup can expand -- the run refuses to guess and stops before changing
   anything, naming the group it could not read; `-AuthorizedKeysFile Administrators` or
@@ -311,7 +317,10 @@ scripted rather than described:
   tightens a file, but `/inheritance:r` drops only *inherited* entries and `/grant` only adds or
   updates the trustees it names, so an explicit entry for anyone else would survive both. Since
   rebuilding is destructive -- an entry another account or a management tool relied on goes with it
-  -- the DACL being replaced is recorded first, and `-Disable` puts it back.
+  -- the DACL being replaced is recorded first, and `-Disable` puts it back. It puts it back only
+  once the key it protects is gone, though: if removing a managed key fails, that file keeps the
+  tightened DACL, so a `-Disable` that could not finish never leaves a live authorized-keys file
+  writable by whoever the original DACL allowed.
 
 Environment matters differently over ssh: the session inherits machine and user variables from the
 registry but **nothing** from a PowerShell `$PROFILE`, so a server configured by environment variable
