@@ -288,6 +288,10 @@ scripted rather than described:
   On the way back out it restores a rule only where that rule is still exactly as this script left
   it; one an administrator has since disabled or tightened is left to them, since reinstating a
   broad original over it would hand out access at the moment the script is taking its own away.
+  That check compares against the *latest* run rather than the first, so neither a rerun that
+  narrows a rule further nor a `-Disable` that got half way through restoring one is later mistaken
+  for somebody else's edit: the original scope on file stays the machine's own throughout, and a
+  partial restore can simply be run again.
   A rule counts as being on that port whether its filter names the port exactly or a range spanning
   it, and a rule that cannot be narrowed -- one managed by group policy, typically -- fails the run
   rather than letting it report a boundary the rule still overrides. One whose filter is `LocalPort Any` is never
@@ -311,7 +315,13 @@ scripted rather than described:
   you are kernel debugging -- sshd ignores `~/.ssh/authorized_keys` and reads
   `C:\ProgramData\ssh\administrators_authorized_keys`. A key in the other file is not an error
   anywhere; it is just a login that never authenticates. The key is appended to that file, never
-  written over it, so other keys and comments in it survive; a file starting with a byte-order mark
+  written over it, so other keys and comments in it survive -- including the file's exact ending: if
+  its last line had no terminator, the newline this script inserts to keep the new key off that line
+  is recorded and taken back out by `-Disable`, so the file comes back byte for byte. Keys are
+  matched the way sshd reads them, on the type and the base64 blob rather than the whole line, so a
+  comment edited by hand afterwards neither hides the key from `-Disable` nor gets it installed a
+  second time by a rerun; a key that has genuinely gone is reported as not found rather than
+  reported removed. A file starting with a byte-order mark
   is refused instead -- sshd reads it as plain bytes, so a UTF-16 file (what Windows PowerShell
   redirection writes by default) is already not being read the way it looks. Membership is resolved
   through nested
