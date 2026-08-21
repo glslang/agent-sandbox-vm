@@ -380,12 +380,19 @@ rules for all of them rather than a separate implementation per component:
    the fields it actually wrote: one it merely looked at keeps whatever the earlier run recorded,
    so a value somebody else set in between is never mistaken for this script's own.
 3. **Verify before reverting.** A field goes back only where the machine still holds the value this
-   script wrote; anything else belongs to whoever changed it since.
+   script wrote; anything else belongs to whoever changed it since. Ownership is per *field*, not
+   per component: an administrator who sets sshd to `Disabled` keeps that, while the service this
+   script started is still stopped. Only the default shell is all-or-nothing, because
+   `<shell> <option>` has to agree with itself.
 4. **Drop what is restored, keep what is not.** What stays on record is exactly the work still
    outstanding, so a later `-Disable` resumes rather than re-applies.
 
 Restore order comes from the entry kind, and within one file the lower kind goes first -- which is
-what puts a key out before that file's terminator, and both before the DACL protecting them. Rerunning
+what puts a key out before that file's terminator, and both before the DACL protecting them. The
+order is also the order a run that is *closing* access has to work in: sshd stops and the key comes
+out first, the firewall is handed back last, so `-Disable` never widens the machine while the
+credential it installed is still live. One consequence worth knowing: a `-Disable` run over the very
+ssh access it is closing loses its session part way through, so run it on the guest. Rerunning
 enable never overwrites that record, and a run that fails part way still records what it had already
 changed -- a machine left modified with nothing written down is one `-Disable` cannot help, so a run
 that changes the machine and then cannot write the record fails rather than reporting success. A record
