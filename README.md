@@ -286,8 +286,9 @@ scripted rather than described:
   rescoped -- such a rule is usually scoped to a program rather than to a port, and narrowing every
   one of them to the ssh client would take the VM's other inbound traffic down with it -- but its
   program and service filters are read to see whether it can reach sshd at all. One that cannot is
-  ignored by name; one that can fails the run alongside the rules that would not narrow, since
-  either way `-ClientAddress` is not the boundary the summary would report. Reclassifying the network to `Private` instead would work in one line, at the cost of activating
+  ignored by name, as is one that can but only from inside the scope this run asked for -- that
+  widens nothing. One that reaches sshd from outside it fails the run alongside the rules that would
+  not narrow, since either way `-ClientAddress` is not the boundary the summary would report. Reclassifying the network to `Private` instead would work in one line, at the cost of activating
   every other `Private` inbound rule: file and printer sharing, network discovery.
 - **The default shell.** OpenSSH runs an exec request through it. `cmd /c` hands the child the
   inherited pipe handles and stays out of the way; PowerShell captures the output through its own
@@ -350,7 +351,8 @@ for no record at all: restore or move the file and rerun.
 
 The record also tracks *which* components the script actually wrote, so `-Disable` only reverts
 those: after an enable with `-SkipDefaultShell`, it leaves a `DefaultShell` someone else configured
-alone rather than deleting it. And it survives a `-Disable` that could not finish -- a firewall rule
+alone rather than deleting it. It also checks before reverting the shell that the value sitting
+there is still the one this script wrote, since a record can outlive the change it describes. And it survives a `-Disable` that could not finish -- a firewall rule
 held by group policy, a `-Skip` switch -- so a later run can pick up where that one stopped; the run
 says what is still outstanding. What that run *did* put back is dropped from the record rather than
 carried, so a later `-Disable` cannot re-apply a value from before the first enable over whatever was

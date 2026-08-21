@@ -718,6 +718,17 @@ function Restore-SshDefaultShell {
         return
     }
 
+    # Only if what is there now is what this script wrote. A record can outlive
+    # the change it describes -- a partial -Disable whose reduced record could
+    # not be saved leaves the full one on disk -- and putting a pre-enable value
+    # over a shell somebody set in the meantime is the one outcome worse than
+    # leaving it alone.
+    $current = Get-OpenSshValue -Name $DefaultShellValueName
+    if ($current -and -not ($current -ieq $CmdPath)) {
+        Write-Host "  Default shell is now $current, which this script did not set; left alone."
+        return
+    }
+
     # Both halves, since setting a shell can have changed both.
     Set-OpenSshValue -Name $DefaultShellValueName -Value $Value
     Set-OpenSshValue -Name $DefaultShellCommandOptionValueName -Value $CommandOption
@@ -827,6 +838,55 @@ function Get-SshdReachReason {
     "allows any local port and is bound to no program or service that would exclude sshd"
 }
 
+function Test-RuleWithinRequestedScope {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Rule,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$RemoteAddress,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$FirewallProfile
+    )
+
+    # A rule that reaches sshd is only a problem if it reaches it from somewhere
+    # -ClientAddress did not ask for. One already inside the requested scope
+    # widens nothing, and failing the run over it would be a refusal the error's
+    # own remedy could not clear.
+    #
+    # Containment is decided by exact membership, not by working out whether one
+    # CIDR sits inside another. That is deliberately conservative: this can only
+    # ever fail to clear a rule that was in fact harmless, never clear one that
+    # was not.
+    try {
+        $ruleAddresses = @(($Rule | Get-NetFirewallAddressFilter).RemoteAddress)
+    } catch {
+        return $false
+    }
+
+    if ($ruleAddresses.Count -eq 0) {
+        return $false
+    }
+
+    foreach ($address in $ruleAddresses) {
+        if ($RemoteAddress -notcontains "$address") {
+            return $false
+        }
+    }
+
+    $requested = Expand-FirewallProfile -Profile $FirewallProfile
+    $ruleProfiles = Expand-FirewallProfile -Profile @("$($Rule.Profile)" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+    foreach ($profileName in $ruleProfiles) {
+        if ($requested -notcontains $profileName) {
+            return $false
+        }
+    }
+
+    $true
+}
+
 function Get-CompetingSshRule {
     param(
         [Parameter(Mandatory = $true)]
@@ -919,12 +979,18 @@ function Enable-RemoteMcpFirewall {
 
     foreach ($rule in Get-CompetingSshRule -Port $scopedPorts -Coverage Any) {
         $reason = Get-SshdReachReason -Rule $rule
-        if ($reason) {
-            Write-Warning "  Reaches sshd and is not narrowed: '$($rule.DisplayName)' -- $reason"
-            $unnarrowed += "$($rule.DisplayName) ($($rule.Name)) -- $reason"
-        } else {
+        if (-not $reason) {
             Write-Host "  Ignored: '$($rule.DisplayName)' allows any local port but is bound to another program or service, so it cannot reach sshd."
+            continue
         }
+
+        if (Test-RuleWithinRequestedScope -Rule $rule -RemoteAddress $RemoteAddress -FirewallProfile $FirewallProfile) {
+            Write-Host "  Ignored: '$($rule.DisplayName)' reaches sshd on any local port, but only from within the scope this run asked for."
+            continue
+        }
+
+        Write-Warning "  Reaches sshd and is not narrowed: '$($rule.DisplayName)' -- $reason"
+        $unnarrowed += "$($rule.DisplayName) ($($rule.Name)) -- $reason"
     }
 
     foreach ($rule in Get-CompetingSshRule -Port $scopedPorts -Coverage Specific) {
@@ -1424,9 +1490,19 @@ if ($Disable) {
             $remaining.AdjustedRules = @($remaining.AdjustedRules)
             $remaining.AuthorizedKeys = @($remaining.AuthorizedKeys)
 
-            Save-RemoteMcpState -State $remaining
             Write-Host ""
-            Write-Warning "Kept $StatePath -- not put back: $($script:UnfinishedRestore -join '; '). Rerun -Disable once the cause is fixed; what it already restored has been dropped from the record."
+            try {
+                Save-RemoteMcpState -State $remaining
+                Write-Warning "Kept $StatePath -- not put back: $($script:UnfinishedRestore -join '; '). Rerun -Disable once the cause is fixed; what it already restored has been dropped from the record."
+            } catch {
+                # The writer leaves the previous file intact when it cannot
+                # swap in the new one -- which is right for the record, but
+                # that file still lists components this run has already put
+                # back, and a later -Disable reading it would treat them as
+                # outstanding. Say so rather than let that be discovered later.
+                Write-Warning "Could not write the reduced record to $StatePath ($($_.Exception.Message))."
+                Write-Warning "$StatePath still describes the state before this run and now over-describes it: it lists components this run already restored. Rerunning -Disable against it would try to put those back a second time. Not put back this run: $($script:UnfinishedRestore -join '; '). Reconcile or remove that file before rerunning."
+            }
         } else {
             Remove-Item -Path $StatePath -Force
         }
