@@ -285,6 +285,9 @@ scripted rather than described:
   cannot be compared to the request without guessing at containment (`10.0.0.5` against
   `LocalSubnet`) is left untouched and fails the run rather than being written over. A rule it does
   not change it also does not record: a record is a claim of ownership, and `-Disable` acts on it.
+  On the way back out it restores a rule only where that rule is still exactly as this script left
+  it; one an administrator has since disabled or tightened is left to them, since reinstating a
+  broad original over it would hand out access at the moment the script is taking its own away.
   A rule counts as being on that port whether its filter names the port exactly or a range spanning
   it, and a rule that cannot be narrowed -- one managed by group policy, typically -- fails the run
   rather than letting it report a boundary the rule still overrides. One whose filter is `LocalPort Any` is never
@@ -337,6 +340,10 @@ and is the better place for anything secret.
 Windows OpenSSH hands a member of the Administrators group a full, unfiltered token, so a server's
 elevation-only tools do work over this. That is the host's logon policy rather than a guarantee, and
 the printed summary includes the one-line check.
+
+`-SshHostAlias` may not contain whitespace: ssh refuses a destination with a space in it whatever the
+quoting, so such an alias could never be connected to. A `-User` with a space is fine -- the printed
+`~/.ssh/config` quotes it, which the real parser accepts.
 
 `-Disable` exits non-zero when something it tried to put back is still in place, so a script driving
 it can tell that from a clean close; a `-Skip` switch is a choice rather than a failure and does not
