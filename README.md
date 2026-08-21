@@ -330,7 +330,8 @@ sshd startup type and running state, the DACL of every authorized-keys file it r
 it installed go to
 `C:\ProgramData\agent-sandbox\remote-mcp-ssh.json` so `-Disable` puts them back exactly. Rerunning
 enable never overwrites that record, and a run that fails part way still records what it had already
-changed -- a machine left modified with nothing written down is one `-Disable` cannot help. A record
+changed -- a machine left modified with nothing written down is one `-Disable` cannot help, so a run
+that changes the machine and then cannot write the record fails rather than reporting success. A record
 that exists but cannot be parsed stops the run before it changes anything, rather than being taken
 for no record at all: restore or move the file and rerun.
 
@@ -338,7 +339,9 @@ The record also tracks *which* components the script actually wrote, so `-Disabl
 those: after an enable with `-SkipDefaultShell`, it leaves a `DefaultShell` someone else configured
 alone rather than deleting it. And it survives a `-Disable` that could not finish -- a firewall rule
 held by group policy, a `-Skip` switch -- so a later run can pick up where that one stopped; the run
-says what is still outstanding.
+says what is still outstanding. What that run *did* put back is dropped from the record rather than
+carried, so a later `-Disable` cannot re-apply a value from before the first enable over whatever was
+configured in the meantime.
 
 `-Disable` leaves the OpenSSH capability and its host keys installed, because removing them would
 change the fingerprint every client has already accepted; `-SkipKeys` keeps the installed keys when
