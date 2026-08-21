@@ -287,8 +287,11 @@ scripted rather than described:
   inherited pipe handles and stays out of the way; PowerShell captures the output through its own
   pipeline and applies its output encoding, which can rewrite the line endings underneath
   line-delimited JSON-RPC, and serializes its progress and error streams as CLIXML on stderr. Either
-  one corrupts the transport. The script points `HKLM:\SOFTWARE\OpenSSH\DefaultShell` at `cmd.exe`;
-  `-SkipDefaultShell` leaves it alone for a VM where something else owns that setting.
+  one corrupts the transport. The script points `HKLM:\SOFTWARE\OpenSSH\DefaultShell` at `cmd.exe`,
+  and corrects `DefaultShellCommandOption` beside it when it is set to something else -- a machine
+  configured for a Unix-style or PowerShell shell carries `-c` or `-Command` there, and sshd would
+  then run `cmd.exe -c ...`, which cmd does not understand. `-SkipDefaultShell` leaves both alone
+  for a VM where something else owns that setting.
 - **Which authorized-keys file.** For a member of the Administrators group -- which the VM user is if
   you are kernel debugging -- sshd ignores `~/.ssh/authorized_keys` and reads
   `C:\ProgramData\ssh\administrators_authorized_keys`. A key in the other file is not an error
@@ -323,8 +326,8 @@ powershell -ExecutionPolicy RemoteSigned -File C:\Setup-RemoteMcp.ps1 -Disable
 ```
 
 Prior scope, profile, and enabled state of every rule it touched, the previous default shell, the
-sshd startup type and running state, the authorized-keys DACL it replaced, and the keys it installed
-go to
+sshd startup type and running state, the DACL of every authorized-keys file it rebuilt, and the keys
+it installed go to
 `C:\ProgramData\agent-sandbox\remote-mcp-ssh.json` so `-Disable` puts them back exactly. Rerunning
 enable never overwrites that record, and a run that fails part way still records what it had already
 changed -- a machine left modified with nothing written down is one `-Disable` cannot help.
