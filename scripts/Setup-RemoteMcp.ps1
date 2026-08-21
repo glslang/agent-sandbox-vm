@@ -455,7 +455,30 @@ function Merge-ChangeLedger {
             Select-Object -First 1
 
         if ($latest) {
-            $entry.Applied = $latest.Applied
+            # Field by field, never wholesale. A rerun's Applied map carries a
+            # value for EVERY field, including ones it only looked at --
+            # Applied starts equal to Original. Copying the lot would write an
+            # administrator's change into the record as this script's own work,
+            # and then rule 3 finds no drift and puts the pre-enable value back
+            # over it. For a firewall profile that means re-widening a rule
+            # somebody deliberately tightened, in the run that is supposed to
+            # be closing access.
+            #
+            # A field the rerun actually WROTE is one whose latest Applied
+            # differs from its latest Original, because Applied only ever
+            # advances on a write that returned. A field it merely observed
+            # keeps whatever the earlier run recorded, so drift against that
+            # earlier value is still detected.
+            foreach ($field in @($latest.Applied.Keys)) {
+                if (-not $entry.Applied.Contains($field)) {
+                    $entry.Applied[$field] = $latest.Applied[$field]
+                    continue
+                }
+
+                if (-not (Test-ChangeValueEqual -Left $latest.Applied[$field] -Right $latest.Original[$field])) {
+                    $entry.Applied[$field] = $latest.Applied[$field]
+                }
+            }
         }
 
         $merged += $entry
@@ -1657,7 +1680,10 @@ function Save-EnableState {
     Save-RemoteMcpState -State ([ordered]@{
         Version             = $StateVersion
         CapabilityInstalled = ([bool]$State.CapabilityInstalled -or $Mutation.CapabilityInstalled)
-        Changes             = @(Merge-ChangeLedger -Stored $State.Changes -Applied $Mutation.Changes)
+        # Rehydrated first: the merge assigns into Applied field by field, and
+        # what comes back from JSON is a PSCustomObject rather than something
+        # indexable.
+        Changes             = @(Merge-ChangeLedger -Stored (ConvertTo-ChangeLedger -Entries $State.Changes) -Applied $Mutation.Changes)
     })
 }
 
