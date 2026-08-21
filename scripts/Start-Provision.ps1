@@ -84,6 +84,14 @@ try {
               -Destination "C:\Setup-KernelDebuggee.ps1"
     Write-Host "  Copied: Setup-KernelDebuggee.ps1"
 
+    # Opens ssh into this VM so an MCP client elsewhere can run a stdio MCP
+    # server here. Nothing runs it during provisioning -- it opens an inbound
+    # port, so it stays opt-in.
+    Copy-Item -ToSession $session `
+              -Path "$PSScriptRoot\Setup-RemoteMcp.ps1" `
+              -Destination "C:\Setup-RemoteMcp.ps1"
+    Write-Host "  Copied: Setup-RemoteMcp.ps1"
+
     $repoRoot = Split-Path -Path $PSScriptRoot -Parent
     $vmStartAgentPath = Join-Path $repoRoot "vm\Start-Agent.ps1"
     if (Test-Path $vmStartAgentPath) {

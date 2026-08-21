@@ -246,6 +246,77 @@ After the debuggee VM shuts down, Secure Boot can be restored on the Hyper-V hos
 .\scripts\Setup-KernelDebugger.ps1 -VMName AgentDevSandbox -EnableVmSecureBoot -SkipFirewall
 ```
 
+### Remote MCP over SSH
+
+An MCP server that has to run on Windows -- a debugger, above all -- does not have to run where the
+harness driving it runs. `Setup-RemoteMcp.ps1` opens ssh into the VM so a client on another machine
+can start a **stdio** MCP server here and talk to it over the ssh channel, which is already a pair of
+pipes. Neither side needs transport code, and a client disconnect still releases whatever the server
+was holding: closing the channel closes the remote stdin.
+
+Inside the VM, run as Administrator with the client's public key:
+
+```powershell
+powershell -ExecutionPolicy RemoteSigned -File C:\Setup-RemoteMcp.ps1 `
+    -PublicKey "ssh-ed25519 AAAA... you@client" `
+    -ClientAddress <client-ip> `
+    -ServerCommand C:\tools\windbg-mcp.exe
+```
+
+`-PublicKeyPath <file>` takes the key from a `.pub` file instead. `-ServerCommand` is only used to
+print the client-side registration, so it can be left off and filled in later. The run ends with the
+`~/.ssh/config` block, the handshake probe, and the `claude mcp add` line to paste on the client.
+
+Four things have to be true for this to work, and three of them fail silently, which is why they are
+scripted rather than described:
+
+- **The firewall.** The rule the OpenSSH capability installs covers `Domain` and `Private` only, and
+  a hypervisor's guest network usually comes up `Public` -- so sshd is running and listening and
+  looks correct from inside the guest while the client's SYNs are dropped. That presents as ssh
+  *hanging* after `Connecting to <address> port 22`, where nothing listening at all would have said
+  `Connection refused` at once. The script adds its own rule on `-FirewallProfile` (default `Any`)
+  scoped to `-ClientAddress`, and narrows every other inbound rule on that port to the same
+  allowlist -- firewall allow rules are additive, so a narrow rule cannot claw back a wider one.
+  Reclassifying the network to `Private` instead would work in one line, at the cost of activating
+  every other `Private` inbound rule: file and printer sharing, network discovery.
+- **The default shell.** OpenSSH runs an exec request through it. `cmd /c` hands the child the
+  inherited pipe handles and stays out of the way; PowerShell captures the output through its own
+  pipeline and applies its output encoding, which can rewrite the line endings underneath
+  line-delimited JSON-RPC, and serializes its progress and error streams as CLIXML on stderr. Either
+  one corrupts the transport. The script points `HKLM:\SOFTWARE\OpenSSH\DefaultShell` at `cmd.exe`;
+  `-SkipDefaultShell` leaves it alone for a VM where something else owns that setting.
+- **Which authorized-keys file.** For a member of the Administrators group -- which the VM user is if
+  you are kernel debugging -- sshd ignores `~/.ssh/authorized_keys` and reads
+  `C:\ProgramData\ssh\administrators_authorized_keys`. A key in the other file is not an error
+  anywhere; it is just a login that never authenticates.
+- **Its ACL.** sshd refuses an authorized-keys file any other principal can write, and logs the
+  refusal nowhere you would think to look. The script strips inheritance and grants only
+  Administrators and SYSTEM, by well-known SID rather than by group name so it works on a
+  non-English Windows too.
+
+Environment matters differently over ssh: the session inherits machine and user variables from the
+registry but **nothing** from a PowerShell `$PROFILE`, so a server configured by environment variable
+needs those set machine-wide. One configured by a file under the user profile -- windbg-mcp's
+`%USERPROFILE%\.windbg-mcp\profiles.json`, for instance -- is immune to how the process was started,
+and is the better place for anything secret.
+
+Windows OpenSSH hands a member of the Administrators group a full, unfiltered token, so a server's
+elevation-only tools do work over this. That is the host's logon policy rather than a guarantee, and
+the printed summary includes the one-line check.
+
+To close it again:
+
+```powershell
+powershell -ExecutionPolicy RemoteSigned -File C:\Setup-RemoteMcp.ps1 -Disable
+```
+
+Prior scope, profile, and enabled state of every rule it touched, the previous default shell, the
+sshd startup type, and the keys it installed go to
+`C:\ProgramData\agent-sandbox\remote-mcp-ssh.json` so `-Disable` puts them back exactly. Rerunning
+enable never overwrites that record. `-Disable` leaves the OpenSSH capability and its host keys
+installed, because removing them would change the fingerprint every client has already accepted;
+`-SkipKeys` keeps the installed keys when only the network exposure is being closed.
+
 ### Restore to clean state
 
 ```powershell
@@ -273,6 +344,7 @@ agent-sandbox-vm/
 |   |-- Install-GhStack.ps1    # VM-side: installs `gh stack` + the gh-stack skill
 |   |-- Setup-KernelDebugger.ps1 # Host-side: WinDbg + KDNET firewall setup
 |   |-- Setup-KernelDebuggee.ps1 # VM-side: BCD/KDNET debuggee setup
+|   |-- Setup-RemoteMcp.ps1    # VM-side: ssh access for a remote MCP client
 |   |-- Save-BaseSnapshot.ps1  # Takes the clean base snapshot
 |   |-- Save-VMCredentials.ps1 # Stores VM credentials encrypted on host
 |   +-- Copy-Artifacts.ps1     # Extracts build outputs from VM to host
